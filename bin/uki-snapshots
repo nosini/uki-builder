@@ -127,7 +127,7 @@ check_entry() {
 make_osrel() { # snapshot role label output
     local src=/.snapshots/$1/snapshot/usr/lib/os-release name
     [[ -f $src ]] || src=/usr/lib/os-release
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090,SC2153  # NAME comes from os-release
     name=$(set +u; . "$src"; printf '%s %s' "${NAME#openSUSE }" "${VERSION_ID:-}")
     [[ $2 == current ]] || name=$3
     {

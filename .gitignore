@@ -1,0 +1,9 @@
+# Never commit signing material or machine-specific state.
+*.key
+*.pem
+*.crt
+*.der
+*.auth
+*.esl
+*.efi
+*.fp
