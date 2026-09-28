@@ -204,7 +204,7 @@ entry_snapshots() {
 # its lock or another sdbootutil (e.g. from snapper's plugin) is running.
 busy() {
     local pid
-    pid=$(tr -dc 0-9 </run/zypp.pid 2>/dev/null || :)
+    pid=$(tr -dc 0-9 2>/dev/null </run/zypp.pid || :)
     if [[ -n $pid && -d /proc/$pid ]]; then return 0; fi
     pgrep -f 'bin/sdbootutil( |$)' >/dev/null
 }
@@ -240,7 +240,8 @@ unboot_others() {
             warn "zypper or sdbootutil still busy after 10 minutes; boot entries of $snap left in place"
             return 0
         fi
-        if sdbootutil remove-all-kernels --disable-predictions "$snap" >/dev/null; then
+        # </dev/null: stdin is the list this loop reads
+        if sdbootutil remove-all-kernels --disable-predictions "$snap" </dev/null >/dev/null; then
             log "removed boot entries of snapshot $snap"
         else
             warn "sdbootutil remove-all-kernels $snap failed"
@@ -263,6 +264,14 @@ for c in btrfs ukify sbsign sbverify bootctl; do
     command -v "$c" >/dev/null || die "$c not found"
 done
 
+# Booted into a read-only snapshot (recovery): its older ukify and stub would
+# rebuild every UKI. Not "booted != default": after a rollback the running,
+# writable system must still move the default.
+if [[ $(btrfs property get -ts / ro 2>/dev/null) == ro=true ]]; then
+    log "running from a read-only snapshot; nothing to do"
+    exit 0
+fi
+
 exec 9>"$LOCK"
 flock -w 900 9 || die "another run did not finish within 15 minutes"
 mkdir -p "$STATE" "$UKIDIR"
@@ -280,7 +289,7 @@ run() {
     mapfile -t prev < <(previous_snapshots "$cur")
     log "current snapshot $cur; previous: ${prev[*]:-none}"
 
-    names=() snaps=() entries=() labels=() default_name=''
+    names=() snaps=() entries=() labels=() default_name='' default_entry=''
     for snap in "$cur" "${prev[@]}"; do
         if [[ $snap == "$cur" ]]; then
             label=''
@@ -302,7 +311,7 @@ run() {
             name=$PREFIX-$snap-$E_KVER.efi
             names+=("$name") snaps+=("$snap") entries+=("$entry") labels+=("$label")
             if [[ $snap == "$cur" && $flavor == "$DEFAULT_FLAVOR" ]]; then
-                default_name=$name
+                default_name=$name default_entry=${entry##*/}
             fi
         done
     done
@@ -334,10 +343,18 @@ run() {
         rm -f "$WORK/$name"
     done
 
+    # Once booted, a snapshot without the enabled path unit (e.g. a rollback
+    # to before the install) never updates its UKI: its kernel updates would
+    # keep booting the old one. Default to sdbootutil's entry there instead.
+    if [[ ! -L /.snapshots/$cur/snapshot/etc/systemd/system/paths.target.wants/uki-snapshots.path ]]; then
+        warn "uki-snapshots.path is not enabled in snapshot $cur; default goes to sdbootutil's entry"
+        default_name=$default_entry
+    fi
+
     if [[ $SET_DEFAULT == yes && -n $default_name && $olddefault != "$default_name" ]]; then
         if [[ $MODE == plan ]]; then
             echo "default $default_name  (currently: ${olddefault:-unset})"
-        elif [[ -f $UKIDIR/$default_name ]]; then
+        elif [[ -f $UKIDIR/$default_name || -f $ENTRIES/$default_name ]]; then
             if bootctl set-default "$default_name" >/dev/null; then
                 log "default boot entry is now $default_name"
                 olddefault=$default_name
@@ -361,12 +378,15 @@ if [[ $MODE == plan ]]; then
 else
     # sdbootutil may still be writing entries (e.g. mid-transaction); repeat
     # until they are the same before and after a run.
+    stable=no
     for attempt in 1 2 3 4 5; do
+        FAILED=0   # a later run retries whatever failed, so only the last counts
         before=$(entries_sig)
         run
-        [[ $(entries_sig) == "$before" ]] && break
+        if [[ $(entries_sig) == "$before" ]]; then stable=yes; break; fi
         log "boot entries changed during run $attempt; syncing again"
     done
+    if [[ $stable == no ]]; then warn "boot entries still changing after $attempt runs"; fi
 fi
 
 exit "$FAILED"

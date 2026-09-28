@@ -50,7 +50,11 @@ trusted, btrfs root in LUKS2/LVM, snapper.
   again after the default has moved.
 - **Default entry.** `bootctl set-default` is pointed at the current
   snapshot's `DEFAULT_FLAVOR` UKI. It is only written when it differs from
-  the current value.
+  the current value. If the current snapshot does not have
+  `uki-snapshots.path` enabled (e.g. after `snapper rollback` to a snapshot
+  from before the install), the default goes to sdbootutil's entry for that
+  snapshot instead, with a warning: once booted, nothing would keep its UKI
+  up to date.
 - **UNBOOT_OTHERS.** For every `pre`/`post` snapshot that has sdbootutil
   entries but is not in the keep set, the script runs
   `sdbootutil remove-all-kernels --disable-predictions N`. The snapshots
@@ -61,7 +65,9 @@ trusted, btrfs root in LUKS2/LVM, snapper.
   `/boot/efi/EFI/Linux` and starts `uki-snapshots.service` (oneshot). The
   service sleeps 5 s first so that sdbootutil can finish its batch. `sync`
   repeats (up to 5 times) until `loader/entries` is the same before and after
-  a run.
+  a run. Only the last run's warnings decide the exit status.
+- **Read-only snapshot boots** (recovery) do nothing: that snapshot's older
+  ukify and stub would otherwise rebuild every UKI.
 
 Usage (run as root, with the full path, because sudo's `secure_path` lacks
 `/usr/local/sbin`):
