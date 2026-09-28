@@ -10,8 +10,9 @@ UKI with your own Secure Boot key and installs it as
 `EFI/Linux/uki-snap-<snapshot>-<kver>.efi` on the ESP.
 
 Built for, and only tested on, one machine: Tumbleweed with systemd-boot
-installed by sdbootutil, shim, Secure Boot in user mode with your own key
-trusted, btrfs root in LUKS2/LVM (unlocked with a FIDO2 key), snapper.
+(originally installed by sdbootutil, which is then removed; see "System
+setup"), shim, Secure Boot in user mode with your own key trusted, btrfs
+root in LUKS2/LVM (unlocked with a FIDO2 key), snapper.
 
 ## Layout
 
@@ -48,9 +49,7 @@ before a transaction. So its state hash finds the initrd built for exactly
 that system, without relying on timing. A rollback copy of such a snapshot
 finds it too. A snapshot without a matching initrd gets no UKI. That
 applies to snapshots made before the cache existed, or while dracut had not
-yet caught up. Its sdbootutil entries then stay in place as long as it
-counts as a previous snapshot. dracut never runs for a snapshot other than
-the running one.
+yet caught up. dracut never runs for a snapshot other than the running one.
 
 The live system counts as trusted because it booted a signed UKI. dracut
 only ever runs there, never against a snapshot or anything on the ESP.
@@ -62,7 +61,7 @@ only ever runs there, never against a snapshot or anything on the ESP.
   description matches `PRE_DESCRIPTION` (`zypp(*`: zypper, myrlyn, YaST).
   They are read from `/.snapshots/N/info.xml`, not through the snapper CLI.
 - **Waiting.** A run first waits (up to `IDLE_WAIT_MIN`) until zypper
-  (`/run/zypp.pid`) and sdbootutil are no longer running.
+  (`/run/zypp.pid`) is no longer running.
 - **Build.** `ukify build` with `sbsign`, checked with `sbverify`, then
   copied to a hidden `.tmp` file on the ESP and renamed into place, with
   `MARGIN_MIB` left free.
@@ -70,7 +69,7 @@ only ever runs there, never against a snapshot or anything on the ESP.
   - `PRETTY_NAME` is the title: `UKI: Tumbleweed 20260924 (<kver>)` or
     `UKI: #N before update MM-DD HH:MM (<kver>)`.
   - `IMAGE_ID` (`1-uki-current`, `2-uki-previous`) becomes the sort key,
-    which puts the UKIs above sdbootutil's entries.
+    which puts the current snapshot first.
   - `IMAGE_VERSION` is `<snapshot>_<kver>`.
 - **Incremental.** `/var/lib/uki-snapshots/<name>.fp` holds a content hash
   of every input: kernel, initrd, command line, uname, os-release, the
@@ -81,30 +80,26 @@ only ever runs there, never against a snapshot or anything on the ESP.
   again after the default has moved. Cached initrds that no wanted snapshot
   refers to are deleted.
 - **Default entry.** `bootctl set-default` points at the current snapshot's
-  `DEFAULT_FLAVOR` UKI, and is written only when it changes. sdbootutil's
-  entry for the current snapshot becomes the default instead, with a
-  warning, in two cases:
-  - The current snapshot has no `uki-snapshots.path` enabled, e.g. after a
-    rollback to before the install. Once booted, nothing there would keep
-    its UKI up to date.
-  - The current snapshot has no UKI, e.g. after a rollback to a snapshot
-    without a cached initrd.
+  `DEFAULT_FLAVOR` UKI, and is written only when it changes.
+  - If the current snapshot has no UKI (e.g. after a rollback to a snapshot
+    without a cached initrd), the default stays where it is, with a
+    warning. The machine then boots the running system rather than the
+    rollback target.
+  - If the current snapshot does not have `uki-snapshots.path` enabled (a
+    rollback to before the install), its UKI still becomes the default,
+    with a warning: run `make install` again after booting it, or its UKIs
+    are no longer updated.
 - **dracut failure.** The existing UKI of the current snapshot stays, and
   stays the default. The service reports the failure.
-- **UNBOOT_OTHERS.** Every `pre`/`post` snapshot that is neither the current
-  nor a previous one loses its sdbootutil entries through
-  `sdbootutil remove-all-kernels --disable-predictions N`. The snapshots
-  themselves stay. `single` snapshots are never touched.
 - **Triggers.**
   - `uki-snapshots.path` watches `/.snapshots` (snapshots created or
     deleted, rollbacks), the rpm database's `Packages.db`,
-    `/etc/crypttab`, `/etc/dracut.conf.d`, `/etc/kernel/cmdline`,
-    sdbootutil's `loader/entries` (for as long as sdbootutil is active) and
+    `/etc/crypttab`, `/etc/dracut.conf.d`, `/etc/kernel/cmdline` and
     `EFI/Linux`.
   - The service also runs after every `snapper-cleanup.service` and once per
     boot.
   - `sync` repeats (up to 5 times) until the default subvolume, the snapshot
-    list, the rpm database and the entries stay the same during a run. Only
+    list and the rpm database stay the same during a run. Only
     the last run's warnings decide the exit status.
 - **Read-only snapshot boots** (recovery) do nothing: that snapshot's older
   ukify and stub would otherwise rebuild every UKI.
@@ -112,7 +107,7 @@ only ever runs there, never against a snapshot or anything on the ESP.
 Usage (run as root, with the full path, because sudo's `secure_path` lacks
 `/usr/local/sbin`):
 
-    /usr/local/sbin/uki-snapshots plan   # dry run: dracut/keep/build/remove/default/unboot
+    /usr/local/sbin/uki-snapshots plan   # dry run: dracut/keep/build/remove/default
     /usr/local/sbin/uki-snapshots sync   # do it (default)
 
 ## Settings
@@ -132,24 +127,22 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
    SELinux denied creating the lock in `/run`. Giving that domain access to
    the signing key, the ESP and efivars is not acceptable. The systemd units
    run unconfined.
-2. **`root=/dev/disk/by-uuid/`, not `root=UUID=`.** `sdbootutil cleanup`
-   treats every boot entry, UKIs included, as its own if its `root=` matches
-   one of sdbootutil's spellings of the root fs. Those spellings
-   (`get_all_rootfs`) are the findmnt SOURCE, `/dev/dm-N`, the lsblk PATH,
-   `UUID=`, `LABEL=`, `PARTUUID=` and `PARTLABEL=`. It deleted all UKIs
-   twice. `/etc/kernel/cmdline` says `root=/dev/mapper/main-root`, one of
-   those spellings, so the script drops it and sets its own. The by-uuid path
-   is the same device to dracut. This depends on sdbootutil internals: after
-   sdbootutil updates, check with `sdbootutil -vv cleanup` that no
-   `uki-snap` file is mentioned.
+2. **`root=/dev/disk/by-uuid/`, not `root=UUID=`.** While sdbootutil was
+   installed, `sdbootutil cleanup` treated every boot entry, UKIs included,
+   as its own if its `root=` matched one of its spellings of the root fs.
+   Those spellings (`get_all_rootfs`) are the findmnt SOURCE, `/dev/dm-N`,
+   the lsblk PATH, `UUID=`, `LABEL=`, `PARTUUID=` and `PARTLABEL=`. It
+   deleted all UKIs twice. `/etc/kernel/cmdline` says
+   `root=/dev/mapper/main-root`, one of those spellings, so the script drops
+   it and sets its own. The by-uuid path is the same device to dracut. Keep
+   it in case sdbootutil ever comes back.
 3. **`set -euo pipefail`.** A `[[ … ]] && cmd` as the last command of a
    function or loop, inside a pipeline or `$(…)`, makes it return non-zero
    and aborts the script. Use `if` in those places.
 4. **sudo** needs the full path (see above).
-5. **Harmless noise:** sdbootutil's "WARNING: Can't determine the new
-   default entry" during remove-all-kernels, and `(reported/absent)` entries
-   in `bootctl list` until the next reboot. ukify's and dracut's output is
-   only shown when they fail.
+5. **Harmless noise:** `(reported/absent)` entries in `bootctl list` until
+   the next reboot. ukify's and dracut's output is only shown when they
+   fail.
 6. **Start limit.** systemd refuses a service after 5 starts within 10 s
    (`StartLimitBurst`), and the path unit that triggers it then fails and
    stops watching. A fast service behind a busy path (the rpm database
@@ -164,14 +157,36 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
    (`/etc/dracut.conf.d/ostree.conf`, which also adds dracut's `ostree`
    module), so the script passes `--reproducible` itself.
 
-## Requirements outside this repo
+## System setup (outside this repo)
 
 - A signing key and certificate that the firmware (db) or shim (MOK) trusts,
   at `KEY`/`CERT` (default `/root/uki-signing/secureboot.{key,pem}`, root
   only). **Never commit keys.**
-- `/boot/efi/loader/loader.conf` with `auto-entries no`.
-- Packages: systemd-boot/ukify, sbsigntools, dracut, sdbootutil, snapper,
-  btrfsprogs.
+- Packages: systemd-boot/ukify, sbsigntools, dracut, snapper, btrfsprogs.
+- **sdbootutil removed and locked** (`sdbootutil`, `sdbootutil-snapper`,
+  `sdbootutil-dracut-measure-pcr`; `zypper al 'sdbootutil*'`, since it is
+  pulled in again as a "Supplements" of systemd-boot and shim). Its hooks
+  and what disables them:
+  - the snapper plugin (`sdbootutil-snapper`): writes entries for every
+    new snapshot; only removing the package stops it
+  - the rpm file trigger (`sdbootutil update` when systemd-boot or shim
+    change; gated by `LOADER_TYPE`)
+  - the kernel scripts, `regenerate-initrd-posttrans` and `weak-modules2` in
+    suse-module-tools; gated by `sdbootutil is-installed`, i.e. the ESP
+    marker `EFI/systemd/installed_by_sdbootutil`
+
+  Without it, kernel updates take the classic path: kernel and initrd are
+  also written to `/boot`, which nothing boots from.
+- ESP cleaned up:
+  - sdbootutil's entries (`loader/entries/<machine-id>-*.conf`), kernels and
+    initrds (`/boot/efi/<machine-id>/`) and its marker are gone
+  - `loader/entries/windows.conf` stays
+  - `EFI/tools/shellx64.efi` is gone
+- `/boot/efi/loader/loader.conf` with `auto-entries no` and `editor no`.
+- **Not handled yet:** shim and systemd-boot on the ESP
+  (`EFI/systemd/shim.efi`, which loads `grub.efi` = systemd-boot) are no
+  longer updated. Layer B replaces them with systemd-boot signed with your
+  own key.
 
 ## Install
 
@@ -188,22 +203,30 @@ first to get a previous-snapshot UKI.
     sudo make uninstall        # disables and removes the units and the script
 
 This leaves the UKIs, the default entry and `/var/lib/uki-snapshots` in
-place. To remove those too, first move the default back to sdbootutil,
-then delete the files:
+place, and nothing keeps them up to date any more. To go back to
+sdbootutil, do that first:
 
-    sudo sdbootutil set-default-snapshot "$(sudo btrfs subvolume get-default / | sed 's:.*/\.snapshots/\([0-9]*\)/.*:\1:')"
+    sudo zypper rl 'sdbootutil*'
+    sudo zypper in sdbootutil sdbootutil-snapper
+    sudo sdbootutil install                 # recreates the marker
+    sudo sdbootutil add-all-kernels
+    sudo sdbootutil set-default-snapshot
     sudo rm /boot/efi/EFI/Linux/uki-snap-*.efi
     sudo rm -r /var/lib/uki-snapshots
-
-Entries that `UNBOOT_OTHERS` removed are not restored.
-`sdbootutil add-all-kernels N` recreates them for snapshot N.
 
 ## Recovery
 
 If a UKI does not boot, press Space (or hold it) at power-on to open the
-systemd-boot menu. Pick a previous snapshot's UKI or sdbootutil's entry for
-the current snapshot ("openSUSE Tumbleweed … (N@…)"). sdbootutil's entries
-stay in place for the current snapshot and the previous snapshots.
+systemd-boot menu and pick another one:
+- the current snapshot's other flavor (longterm)
+- a previous snapshot ("UKI: #N before update …"), which boots read-only;
+  `snapper rollback` from there makes it the default
+
+If none of them boots, use a live USB stick. Unlock and mount the root file
+system, chroot into it, then either run
+`/usr/local/sbin/uki-snapshots sync` or go back to sdbootutil (see
+Uninstall). Once Layer B is in place, a live USB stick only boots if Secure
+Boot is disabled in the firmware setup first, or its keys are reset.
 
 ## Threat model
 
@@ -214,17 +237,21 @@ boot the machine into an unlocked disk.
 
 - **Trusted:** the encrypted btrfs root, including read-only snapshots and
   `/var`, and the signing key in `/root/uki-signing`.
-- **Untrusted:** everything on the ESP and on `/boot`. That includes
-  sdbootutil's entries, kernels and initrds. Nothing from there is signed.
+- **Untrusted:** everything on the ESP and on `/boot`. Nothing from there
+  is signed.
 - **The key is the trust anchor.** It is stored unencrypted inside LUKS.
   Anyone with root on the running system can sign anything this firmware
   will boot.
-- **Not closed yet:**
-  - As long as sdbootutil's type #1 entries are bootable, they load an
-    unsigned initrd from the ESP. Their command line can also be edited
-    unless `loader.conf` has `editor no`.
-  - The firmware trusts the Microsoft 3rd-party UEFI CA, so shim and any
-    openSUSE-signed kernel run, with any initrd.
+- **Closed by the system setup:** no type #1 entries (unsigned initrd,
+  editable command line) are left in the menu, the command line editor is
+  off, and there is no UEFI shell. The UKIs' embedded command line cannot be
+  overridden while Secure Boot is on.
+- **Not closed yet (Layer B):**
+  - The firmware trusts the Microsoft 3rd-party UEFI CA, so an attacker can
+    put their own chain on the ESP: shim with any openSUSE-signed kernel and
+    any initrd, or a live system.
+  - `MokManager.efi` is on the ESP. A key enrolled in MOK, e.g. from such a
+    live system, is trusted by shim.
   - Any code that runs before unlock can ask the FIDO2 key to unlock the disk
     (and capture its PIN, if the slot requires one).
 - **Old UKIs stay valid.** Every UKI ever signed boots as long as the key is

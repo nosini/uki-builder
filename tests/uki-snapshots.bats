@@ -3,9 +3,9 @@
 
 load helpers
 
-# Live system 971 (default and booted), two older zypper pre snapshots that
-# were made before any initrd was cached, and sdbootutil entries (with
-# tampered content) for all of them plus a post and an older pre snapshot.
+# Live system 971 (default and booted), three older zypper pre snapshots
+# that were made before any initrd was cached, a post snapshot, and leftover
+# sdbootutil entries with tampered content.
 setup() {
     setup_system
     echo 971 >"$T/default"; echo 971 >"$T/booted"
@@ -39,18 +39,14 @@ uki-snap-971-$KDEF.efi" ]
     [ "$(efi_default)" = "uki-snap-971-$KDEF.efi" ]
 }
 
-@test "previous snapshots without a cached initrd get no UKI but keep their entries" {
+@test "previous snapshots without a cached initrd get no UKI; sdbootutil is never used" {
     run uki sync
     [ "$status" -eq 0 ]
     [[ $output == *"no initrd built for the state of snapshot 965"* ]]
     ! ls "$T/esp/EFI/Linux" | grep -q -e 965 -e 960
-    # 965 and 960 are still the previous snapshots: their sdbootutil entries stay
-    ls "$T/esp/loader/entries" | grep -q -- "-965.conf"
-    ls "$T/esp/loader/entries" | grep -q -- "-960.conf"
-    # older pre and post snapshots lose theirs, all in one run
-    grep -qx "sdbootutil remove-all-kernels --disable-predictions 955" "$T/calls"
-    grep -qx "sdbootutil remove-all-kernels --disable-predictions 966" "$T/calls"
-    ! grep -q "remove-all-kernels.* 971" "$T/calls"
+    ! grep -q sdbootutil "$T/calls"
+    # leftover entries are not touched either
+    [ "$(ls "$T/esp/loader/entries" | wc -l)" -eq 10 ]
 }
 
 @test "second sync changes nothing" {
@@ -125,34 +121,37 @@ uki-snap-971-$KDEF.efi" ]
     [ ! -e "$T/esp/EFI/Linux/uki-snap-971-$KDEF.efi" ]
 }
 
-@test "rollback to a snapshot without the path unit: default goes to sdbootutil" {
+@test "rollback to a snapshot without the path unit: its UKI boots, with a warning" {
     uki sync
-    snapshot 973 single "writable copy of #900"
+    transaction 972
+    uki sync
+    snapshot 973 single "writable copy of #972"
+    rm -rf "$T/snapshots/973/snapshot"
+    cp -a "$T/snapshots/972/snapshot" "$T/snapshots/973/snapshot"
+    rm "$T/snapshots/973/snapshot/.readonly"
     rm "$T/snapshots/973/snapshot/etc/systemd/system/paths.target.wants/uki-snapshots.path"
-    echo "rpm-old" >"$T/snapshots/973/snapshot/usr/lib/sysimage/rpm/Packages.db"
-    esp_entry 973 "$KDEF"
     echo 973 >"$T/default"
 
     run uki sync
     echo "$output"
     [ "$status" -eq 1 ]
     [[ $output == *"not enabled in snapshot 973"* ]]
-    [ "$(efi_default)" = "$MID-$KDEF-973.conf" ]
+    [ "$(efi_default)" = "uki-snap-973-$KDEF.efi" ]
 }
 
-@test "rollback to a snapshot without an initrd: default goes to sdbootutil" {
+@test "rollback to a snapshot without an initrd: the default stays on the running system" {
     uki sync
     snapshot 973 single "writable copy of #900"
     echo "rpm-old" >"$T/snapshots/973/snapshot/usr/lib/sysimage/rpm/Packages.db"
-    esp_entry 973 "$KDEF"
     echo 973 >"$T/default"
 
     run uki sync
     echo "$output"
+    [ "$status" -eq 1 ]
     [[ $output == *"no default UKI for snapshot 973"* ]]
-    [ "$(efi_default)" = "$MID-$KDEF-973.conf" ]
-    # and the old snapshot's UKI no longer boots by default, so it goes
-    [ ! -e "$T/esp/EFI/Linux/uki-snap-971-$KDEF.efi" ]
+    [ "$(efi_default)" = "uki-snap-971-$KDEF.efi" ]
+    [ -e "$T/esp/EFI/Linux/uki-snap-971-$KDEF.efi" ]
+    ! ls "$T/esp/EFI/Linux" | grep -q 973
 }
 
 @test "booted from a read-only snapshot: nothing happens" {
@@ -170,7 +169,6 @@ uki-snap-971-$KDEF.efi" ]
     [ "$status" -eq 0 ]
     [[ $output == *"dracut  $KDEF"* ]]
     [[ $output == *"build   uki-snap-971-$KDEF.efi  (after dracut)"* ]]
-    [[ $output == *"unboot  snapshot 955 (pre)"* ]]
     [ ! -s "$T/calls" ]
     [ -z "$(ukis)" ]
     [ -z "$(ls "$T/state/sysstate")" ]

@@ -28,7 +28,6 @@ LOCK=$T/run/lock
 ZYPP_PID=$T/run/zypp.pid
 EFIVARS=$T/efivars
 STUBS=$T/stubs
-MACHINE_ID_FILE=$T/machine-id
 IDLE_WAIT_MIN=0
 DRACUT_ARGS=(--force)
 LIVE_ROOT=$T/snapshots/\$(cat $T/booted)/snapshot
@@ -79,11 +78,10 @@ EOF
 echo "bootctl $*" >>"$T/calls"
 { printf '\x07\x00\x00\x00'; printf '%s\0' "$2" | iconv -t UTF-16LE; } >"$T/efivars/LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 EOF
-    # Reads stdin like a careless script would.
+    # Must never be called: sdbootutil is removed on the real system.
     mock sdbootutil <<'EOF'
-cat >/dev/null
 echo "sdbootutil $*" >>"$T/calls"
-rm -f "$T/esp/loader/entries/$MID"-*-"${@: -1}".conf
+exit 1
 EOF
 }
 
@@ -126,7 +124,8 @@ transaction() {
     echo "rpm after $pre" >"$live/usr/lib/sysimage/rpm/Packages.db"
 }
 
-# sdbootutil's entry for snapshot N, kernel K, with tampered content.
+# A leftover sdbootutil entry for snapshot N, kernel K, with tampered
+# content: nothing of it may end up in a UKI.
 esp_entry() {
     mkdir -p "$T/esp/$MID/$2"
     echo evil >"$T/esp/$MID/$2/initrd-evil"

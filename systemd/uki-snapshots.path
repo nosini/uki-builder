@@ -11,8 +11,6 @@ PathChanged=/usr/lib/sysimage/rpm/Packages.db
 PathChanged=/etc/crypttab
 PathChanged=/etc/dracut.conf.d
 PathChanged=/etc/kernel/cmdline
-# sdbootutil rewrites its entries on rollbacks (as long as it is active)
-PathChanged=/boot/efi/loader/entries
 # rebuild quickly if a UKI goes missing
 PathChanged=/boot/efi/EFI/Linux
 Unit=uki-snapshots.service

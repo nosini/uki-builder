@@ -16,13 +16,10 @@
 #             exactly that state. A snapshot without one (made before the
 #             cache existed, or while it was out of date) gets no UKI.
 #
-# sdbootutil's entries on the ESP are only listed: for UNBOOT_OTHERS, and to
-# hand the default back to sdbootutil when there is no UKI to point it at.
-#
 # It creates and deletes only EFI/Linux/$PREFIX-*.efi (and hidden .tmp
-# staging files) on the ESP, sets the systemd-boot default entry
-# (SET_DEFAULT), and removes sdbootutil's entries of pre/post snapshots it
-# does not use, through sdbootutil itself (UNBOOT_OTHERS).
+# staging files) on the ESP and sets the systemd-boot default entry
+# (SET_DEFAULT). It expects sdbootutil to be removed: its boot entries load
+# an unsigned initrd from the ESP, and its cleanup deletes UKIs.
 #
 #   uki-snapshots plan   show what would be done; change nothing
 #   uki-snapshots sync   do it (default)
@@ -42,7 +39,6 @@ PRE_DESCRIPTION='zypp(*'     # glob: which "pre" snapshots are updates (zypper, 
 FLAVORS=(default longterm)   # newest kernel of each flavor, where present
 DEFAULT_FLAVOR=default       # which of the current system's UKIs boots by default
 SET_DEFAULT=yes              # no = leave the default entry alone
-UNBOOT_OTHERS=yes            # remove sdbootutil's entries of other pre/post snapshots
 PREFIX=uki-snap              # EFI/Linux/$PREFIX-<snapshot>-<kernel>.efi
 MARGIN_MIB=64                # always leave at least this much free on the ESP
 STATE=/var/lib/uki-snapshots # initrd cache, fingerprints (/var is shared by all snapshots)
@@ -53,12 +49,11 @@ DRACUT_ARGS=(--reproducible --force --tmpdir /var/tmp --quiet)   # as sdbootutil
 SYSSTATE_PATHS=(/usr/lib/sysimage/rpm /etc/crypttab /etc/fstab /etc/dracut.conf
     /etc/dracut.conf.d /etc/modprobe.d /etc/modules-load.d /etc/udev/rules.d
     /etc/vconsole.conf /etc/locale.conf)
-IDLE_WAIT_MIN=60             # wait this long for zypper and sdbootutil to finish
+IDLE_WAIT_MIN=60             # wait this long for zypper to finish
 LOCK=/run/uki-snapshots.lock
 ZYPP_PID=/run/zypp.pid
 EFIVARS=/sys/firmware/efi/efivars
 STUBS=/usr/lib/systemd/boot/efi
-MACHINE_ID_FILE=/etc/machine-id
 LIVE_ROOT=''                 # the running system's root, for tests
 # -----------------------------------------------------------------------------
 
@@ -67,8 +62,6 @@ CONF=${UKI_SNAPSHOTS_CONF:-/etc/uki-snapshots.conf}
 if [[ -f $CONF ]]; then . "$CONF"; fi
 
 UKIDIR=$ESP/EFI/Linux
-ENTRIES=$ESP/loader/entries
-MID=$(<"$MACHINE_ID_FILE")
 DEFAULT_VAR=$EFIVARS/LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 MODE=${1:-sync}
 FAILED=0
@@ -225,10 +218,11 @@ update_live_initrds() {
 
 # Kernel command line for snapshot $1: its /etc/kernel/cmdline, with root=
 # and the subvol= in rootflags= set here. root= is spelled
-# /dev/disk/by-uuid/: sdbootutil's cleanup treats entries whose root= matches
-# one of its spellings of this file system (UUID=, LABEL=, PARTUUID=,
-# /dev/mapper/..., /dev/dm-N) as its own and deletes UKIs it cannot map to a
-# kernel, and this spelling is not among them.
+# /dev/disk/by-uuid/: sdbootutil's cleanup (should it ever run again)
+# treats entries whose root= matches one of its spellings of this file
+# system (UUID=, LABEL=, PARTUUID=, /dev/mapper/..., /dev/dm-N) as its own
+# and deletes UKIs it cannot map to a kernel, and this spelling is not among
+# them.
 make_cmdline() {
     local src word item flags='' rest=''
     local -a words out=()
@@ -255,8 +249,7 @@ osrel_value() { sed -n "s/^$2=//p" "$1" | head -n1 | sed -e 's/^"\(.*\)"$/\1/' -
 # os-release for the UKI, taken from the snapshot itself.
 #  - IMAGE_VERSION "<snapshot>_<kernel>" gives a sensible order within a
 #    group (newest snapshot first, default before longterm).
-#  - IMAGE_ID is the menu sort-key: "1-uki-current" and "2-uki-previous" sort
-#    before sdbootutil's "opensuse-tumbleweed" and "snapper-..." entries.
+#  - IMAGE_ID is the menu sort-key: "1-uki-current" before "2-uki-previous".
 make_osrel() { # snapshot role label kver output
     local src name
     src=$(snapshot_root "$1")/usr/lib/os-release
@@ -360,36 +353,12 @@ gc_cache() {
     done
 }
 
-# sdbootutil's entry file (name only) for snapshot $1 with the newest kernel
-# of flavor $2. Only used to point the default at it.
-sdboot_entry() {
-    local snap=$1 flavor=$2 f v best='' bestv=''
-    for f in "$ENTRIES/$MID"-*.conf; do
-        [[ -f $f ]] || continue
-        v=$(sed -n 's/^version[[:space:]]\+//p' "$f" | head -n1)
-        v=${v%%[[:space:]]*}
-        [[ $v == "$snap@"*"-$flavor" ]] || continue
-        v=${v#*@}
-        if [[ -z $bestv || $(printf '%s\n' "$bestv" "$v" | sort -V | tail -n1) == "$v" ]]; then
-            best=${f##*/} bestv=$v
-        fi
-    done
-    if [[ -n $best ]]; then echo "$best"; fi
-}
-
-# Snapshot numbers that sdbootutil has boot entries for.
-entry_snapshots() {
-    sed -n 's/^version[[:space:]]\+\([0-9]\+\)@.*/\1/p' "$ENTRIES/$MID"-*.conf 2>/dev/null | sort -un
-}
-
-# sdbootutil has no locking of its own, and a transaction changes what the
-# initrd is built from, so wait while zypper holds its lock or another
-# sdbootutil (e.g. from snapper's plugin) is running.
+# A transaction changes what the initrd is built from, so wait while zypper
+# holds its lock.
 busy() {
     local pid
     pid=$(tr -dc 0-9 2>/dev/null <"$ZYPP_PID" || :)
-    if [[ -n $pid && -d /proc/$pid ]]; then return 0; fi
-    pgrep -f 'bin/sdbootutil( |$)' >/dev/null
+    [[ -n $pid && -d /proc/$pid ]]
 }
 
 wait_until_idle() {
@@ -399,37 +368,6 @@ wait_until_idle() {
         (( i < IDLE_WAIT_MIN * 12 )) || return 1
         sleep 5
     done
-}
-
-# Remove sdbootutil's boot entries for every pre/post snapshot that is not
-# among the arguments. The snapshots themselves stay; only their boot entries
-# go (sdbootutil also frees kernels/initrds nothing else uses). "single"
-# snapshots (rollback copies, manual ones) are never touched.
-unboot_others() {
-    local snap type info
-    local -A keep=()
-    for snap in "$@"; do keep[$snap]=1; done
-    while read -r snap; do
-        [[ -z ${keep[$snap]:-} ]] || continue
-        info=$SNAPSHOTS/$snap/info.xml
-        [[ -f $info ]] || continue
-        type=$(xml_field "$info" type)
-        [[ $type == pre || $type == post ]] || continue
-        if [[ $MODE == plan ]]; then
-            echo "unboot  snapshot $snap ($type)"
-            continue
-        fi
-        if ! wait_until_idle; then
-            warn "zypper or sdbootutil still busy; boot entries of $snap left in place"
-            return 0
-        fi
-        # </dev/null: stdin is the list this loop reads
-        if sdbootutil remove-all-kernels --disable-predictions "$snap" </dev/null >/dev/null; then
-            log "removed boot entries of snapshot $snap"
-        else
-            warn "sdbootutil remove-all-kernels $snap failed"
-        fi
-    done < <(entry_snapshots)
 }
 
 efi_default() {
@@ -442,7 +380,7 @@ world_sig() {
     {
         btrfs subvolume get-default /
         ls "$SNAPSHOTS"
-        find "$LIVE_ROOT/usr/lib/sysimage/rpm" "$ENTRIES" -maxdepth 1 -type f -printf '%p %s %T@\n' | sort
+        find "$LIVE_ROOT/usr/lib/sysimage/rpm" -maxdepth 1 -type f -printf '%p %s %T@\n' | sort
     } 2>/dev/null | hash
 }
 
@@ -475,15 +413,15 @@ trap 'rm -rf "$WORK"' EXIT
 
 run() {
     local snap flavor k state initrd cmdline label when role fp name i
-    local want default_name='' default_entry='' olddefault
+    local default_name='' olddefault
     local -a prev names=() snaps=() kvers=() initrds=() cmdlines=() labels=() states=() kept=()
 
     read_default
     BOOTED=$(booted_snapshot)
     if [[ $MODE == plan ]]; then
-        if busy; then log "note: zypper or sdbootutil is running; this may change"; fi
+        if busy; then log "note: zypper is running; this may change"; fi
     elif ! wait_until_idle; then
-        warn "zypper or sdbootutil still busy after $IDLE_WAIT_MIN minutes; nothing done"
+        warn "zypper still busy after $IDLE_WAIT_MIN minutes; nothing done"
         return 0
     fi
 
@@ -575,36 +513,26 @@ run() {
         rm -f "$WORK/$name"
     done
 
-    # Default entry. sdbootutil's entry takes over when a UKI would go stale
-    # or is missing: a snapshot without the enabled path unit (e.g. a
-    # rollback to before the install) never updates its UKI once booted, and
-    # without a UKI for the current snapshot the old default would keep
-    # booting another snapshot.
-    default_entry=$(sdboot_entry "$CUR" "$DEFAULT_FLAVOR")
-    want=$default_name
+    # Default entry: the current snapshot's UKI. Without one (e.g. after a
+    # rollback to a snapshot that has no initrd) the default stays where it
+    # is, which boots the running system rather than nothing.
     if [[ ! -L $(snapshot_root "$CUR")/etc/systemd/system/paths.target.wants/uki-snapshots.path ]]; then
-        warn "uki-snapshots.path is not enabled in snapshot $CUR; default goes to sdbootutil's entry"
-        want=$default_entry
-    elif [[ -z $want ]]; then
-        want=$default_entry
-        if [[ -n $want ]]; then
-            warn "no default UKI for snapshot $CUR; default goes to sdbootutil's entry"
-        fi
+        warn "uki-snapshots.path is not enabled in snapshot $CUR; once booted, its UKIs are no longer updated: run 'make install' there"
     fi
-    if [[ $SET_DEFAULT == yes && -z $want ]]; then
-        warn "nothing to boot snapshot $CUR by default; default left at ${olddefault:-unset}"
-    elif [[ $SET_DEFAULT == yes && $olddefault != "$want" ]]; then
+    if [[ $SET_DEFAULT == yes && -z $default_name ]]; then
+        warn "no default UKI for snapshot $CUR; default boot entry left at ${olddefault:-unset}"
+    elif [[ $SET_DEFAULT == yes && $olddefault != "$default_name" ]]; then
         if [[ $MODE == plan ]]; then
-            echo "default $want  (currently: ${olddefault:-unset})"
-        elif [[ -f $UKIDIR/$want || -f $ENTRIES/$want ]]; then
-            if bootctl set-default "$want" >/dev/null; then
-                log "default boot entry is now $want"
-                olddefault=$want
+            echo "default $default_name  (currently: ${olddefault:-unset})"
+        elif [[ -f $UKIDIR/$default_name ]]; then
+            if bootctl set-default "$default_name" >/dev/null; then
+                log "default boot entry is now $default_name"
+                olddefault=$default_name
             else
-                warn "bootctl set-default $want failed"
+                warn "bootctl set-default $default_name failed"
             fi
         else
-            warn "$want is missing; default boot entry left at ${olddefault:-unset}"
+            warn "$default_name is missing; default boot entry left at ${olddefault:-unset}"
         fi
     fi
 
@@ -613,18 +541,13 @@ run() {
         prune "${names[@]}" "${kept[@]}" "$olddefault"
         gc_cache "${LIVE:-}" "${states[@]}"
     fi
-
-    # The current and the previous snapshots keep their entries, including
-    # previous ones without a UKI (no initrd): sdbootutil's entry is then
-    # their only way to boot.
-    if [[ $UNBOOT_OTHERS == yes ]]; then unboot_others "$CUR" "${prev[@]}"; fi
 }
 
 if [[ $MODE == plan ]]; then
     run
 else
-    # Snapshots, the rpm database or sdbootutil's entries may change while
-    # this runs; repeat until they stay the same.
+    # Snapshots or the rpm database may change while this runs; repeat until
+    # they stay the same.
     stable=no
     for attempt in 1 2 3 4 5; do
         FAILED=0   # a later run retries whatever failed, so only the last counts
