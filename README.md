@@ -149,9 +149,12 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
    default entry" during remove-all-kernels, and `(reported/absent)` entries
    in `bootctl list` until the next reboot. ukify's and dracut's output is
    only shown when they fail.
-6. **`/.snapshots` does not work as a trigger.** A path unit on it saw
-   nothing during a zypper transaction that created a pre/post pair, so the
-   script triggers on the rpm database instead.
+6. **Start limit.** systemd refuses a service after 5 starts within 10 s
+   (`StartLimitBurst`), and the path unit that triggers it then fails and
+   stops watching. A fast service behind a busy path (the rpm database
+   changes many times per transaction) hits that at once. The
+   `ExecStartPre=sleep 5` keeps this service well below it; keep it, or set
+   `StartLimitIntervalSec=0`.
 7. **`reproducible=yes` comes from the ostree package**
    (`/etc/dracut.conf.d/ostree.conf`, which also adds dracut's `ostree`
    module), so the script passes `--reproducible` itself.
