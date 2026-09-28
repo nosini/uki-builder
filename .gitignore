@@ -7,3 +7,6 @@
 *.esl
 *.efi
 *.fp
+
+# Machine data copied for analysis (event log, efivars); never commit.
+local/
