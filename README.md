@@ -142,3 +142,7 @@ current snapshot and for the previous snapshots that the UKIs are built from.
   the menu unless the editor is disabled in `loader.conf`.
 - The script runs as root and reads data from snapshots: it sources
   `os-release` and parses `info.xml` with sed.
+
+## License
+
+GNU Affero General Public License v3.0, see [LICENSE](LICENSE).
