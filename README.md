@@ -180,8 +180,16 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
 - ESP cleaned up:
   - sdbootutil's entries (`loader/entries/<machine-id>-*.conf`), kernels and
     initrds (`/boot/efi/<machine-id>/`) and its marker are gone
-  - `loader/entries/windows.conf` stays
-  - `EFI/tools/shellx64.efi` is gone
+  - `EFI/tools/shellx64.efi` and the `windows.conf` entry that used it are
+    gone. A UEFI shell runs before the OS and can write the firmware
+    variables shim trusts (MOK). This one was unsigned, so with Secure Boot
+    on the entry could not start anyway.
+- **Windows** with its own ESP on another disk cannot be started by
+  systemd-boot. Boot it through its firmware entry (Windows Boot
+  Manager): the firmware boot menu at power-on, "Reboot Into Firmware
+  Interface" in systemd-boot, or once from Linux with
+  `sudo efibootmgr --bootnext XXXX && sudo systemctl reboot` (XXXX: its
+  number in `efibootmgr`).
 - `/boot/efi/loader/loader.conf` with `auto-entries no` and `editor no`.
 - **Not handled yet:** shim and systemd-boot on the ESP
   (`EFI/systemd/shim.efi`, which loads `grub.efi` = systemd-boot) are no
