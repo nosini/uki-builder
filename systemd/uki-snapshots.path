@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch boot entries and UKIs to keep signed UKIs in sync
+
+[Path]
+# sdbootutil changes these on snapshots, kernel/initrd updates and rollbacks
+PathChanged=/boot/efi/loader/entries
+# rebuild quickly if a UKI goes missing
+PathChanged=/boot/efi/EFI/Linux
+Unit=uki-snapshots.service
+
+[Install]
+WantedBy=paths.target

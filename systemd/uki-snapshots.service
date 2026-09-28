@@ -1,0 +1,10 @@
+[Unit]
+Description=Build and sign UKIs for the current and previous snapshots
+RequiresMountsFor=/boot/efi /var/lib /var/tmp
+
+[Service]
+Type=oneshot
+# let sdbootutil finish writing its batch of entries first
+ExecStartPre=/usr/bin/sleep 5
+ExecStart=/usr/local/sbin/uki-snapshots sync
+Nice=10

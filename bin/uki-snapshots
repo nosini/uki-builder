@@ -1,0 +1,372 @@
+#!/bin/bash
+# uki-snapshots - build and sign Unified Kernel Images from sdbootutil's
+# boot entries: the running snapshot plus the "pre" snapshots of the last
+# $PREVIOUS zypper transactions, newest kernel of each flavor.
+#
+# Run by uki-snapshots.service, which uki-snapshots.path starts whenever
+# sdbootutil changes its entries in loader/entries.
+#
+# It creates and deletes only EFI/Linux/$PREFIX-*.efi (and hidden .tmp
+# staging files). Besides that it sets the systemd-boot default entry
+# (SET_DEFAULT) and, through sdbootutil itself, removes the boot entries of
+# pre/post snapshots it does not use (UNBOOT_OTHERS); the snapshots stay.
+# shim, systemd-boot and sdbootutil's remaining entries are only read.
+#
+#   uki-snapshots plan   show what would be kept, built, removed; change nothing
+#   uki-snapshots sync   do it (default)
+
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+# ---- settings ---------------------------------------------------------------
+ESP=/boot/efi
+KEY=/root/uki-signing/secureboot.key
+CERT=/root/uki-signing/secureboot.pem
+PREVIOUS=2                   # zypper pre-snapshots to keep besides the current one
+FLAVORS=(default longterm)   # newest kernel of each flavor, where present
+DEFAULT_FLAVOR=default       # which of the current system's UKIs boots by default
+SET_DEFAULT=yes              # no = leave the default entry to sdbootutil
+UNBOOT_OTHERS=yes            # remove sdbootutil's entries of other pre/post snapshots
+PREFIX=uki-snap              # EFI/Linux/$PREFIX-<snapshot>-<kernel>.efi
+MARGIN_MIB=64                # always leave at least this much free on the ESP
+STATE=/var/lib/uki-snapshots # build fingerprints (/var is shared by all snapshots)
+LOCK=/run/uki-snapshots.lock
+# -----------------------------------------------------------------------------
+
+UKIDIR=$ESP/EFI/Linux
+ENTRIES=$ESP/loader/entries
+MID=$(</etc/machine-id)
+DEFAULT_VAR=/sys/firmware/efi/efivars/LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+MODE=${1:-sync}
+FAILED=0
+
+log()  { printf 'uki-snapshots: %s\n' "$*" >&2; logger -t uki-snapshots -- "$*" 2>/dev/null || :; }
+die()  { log "error: $*"; exit 1; }
+warn() { log "warning: $*"; FAILED=1; }
+
+xml_field() { sed -n "s:.*<$2>\(.*\)</$2>.*:\1:p" "$1" | head -n1; }
+
+current_snapshot() {
+    local out
+    out=$(btrfs subvolume get-default /) || die "btrfs subvolume get-default / failed"
+    [[ $out =~ @/\.snapshots/([0-9]+)/snapshot$ ]] \
+        || die "default subvolume is not a snapper snapshot: $out"
+    echo "${BASH_REMATCH[1]}"
+}
+
+# Newest "pre" snapshots taken by zypp (zypper, myrlyn, ...) that sdbootutil
+# has entries for, excluding the running snapshot.
+previous_snapshots() {
+    local cur=$1 info num
+    for info in /.snapshots/*/info.xml; do
+        [[ -f $info ]] || continue
+        num=$(xml_field "$info" num)
+        [[ $num =~ ^[0-9]+$ && $num != "$cur" ]] || continue
+        [[ $(xml_field "$info" type) == pre ]] || continue
+        [[ $(xml_field "$info" description) == zypp\(* ]] || continue
+        grep -qE "^version[[:space:]]+$num@" "$ENTRIES/$MID"-*.conf 2>/dev/null || continue
+        echo "$num"
+    done | sort -rn | head -n "$PREVIOUS"
+}
+
+# Entry file for snapshot $1 with the newest kernel of flavor $2 (or nothing).
+pick_entry() {
+    local snap=$1 flavor=$2 f v best='' bestv=''
+    for f in "$ENTRIES/$MID"-*.conf; do
+        [[ -f $f ]] || continue
+        v=$(sed -n 's/^version[[:space:]]\+//p' "$f" | head -n1)
+        v=${v%%[[:space:]]*}
+        [[ $v == "$snap@"*"-$flavor" ]] || continue
+        v=${v#*@}
+        if [[ -z $bestv || $(printf '%s\n' "$bestv" "$v" | sort -V | tail -n1) == "$v" ]]; then
+            best=$f bestv=$v
+        fi
+    done
+    [[ -z $best ]] || echo "$best"
+}
+
+# Load a BLS type #1 entry into E_KVER, E_LINUX, E_INITRDS[], E_OPTIONS.
+parse_entry() {
+    local key value
+    local -a parts
+    E_KVER='' E_LINUX='' E_OPTIONS='' E_INITRDS=()
+    while read -r key value; do
+        case $key in
+            version) E_KVER=${value#*@} ;;
+            linux)   E_LINUX=$value ;;
+            initrd)  read -ra parts <<<"$value"; E_INITRDS+=("${parts[@]}") ;;
+            options) E_OPTIONS=${E_OPTIONS:+$E_OPTIONS }$value ;;
+        esac
+    done <"$1"
+    # sdbootutil treats every entry whose root= matches one of its spellings
+    # of this root file system (UUID=, LABEL=, PARTUUID=, /dev/mapper/...,
+    # /dev/dm-N) as its own, and its cleanup deletes UKIs it cannot map to a
+    # kernel. /dev/disk/by-uuid/ is the same device to the initrd (dracut
+    # turns root=UUID= into exactly that), but sdbootutil leaves it alone.
+    E_OPTIONS=${E_OPTIONS//root=UUID=/root=/dev/disk/by-uuid/}
+}
+
+# The parsed entry must be complete, its files present, and it must boot
+# exactly snapshot $1.
+check_entry() {
+    local i
+    [[ -n $E_KVER && -n $E_LINUX && ${#E_INITRDS[@]} -gt 0 ]] || return 1
+    [[ -f $ESP$E_LINUX ]] || return 1
+    for i in "${E_INITRDS[@]}"; do [[ -f $ESP$i ]] || return 1; done
+    [[ " $E_OPTIONS " == *" rootflags=subvol=@/.snapshots/$1/snapshot "* ]] || return 1
+    [[ " $E_OPTIONS " == *" root=/dev/disk/by-uuid/"* ]] \
+        || log "warning: no root=UUID= in ${E_KVER} entry for $1; sdbootutil may delete its UKI"
+}
+
+# os-release for the UKI, taken from the snapshot itself.
+#  - IMAGE_VERSION "<snapshot>_<kernel>" gives a sensible order within a
+#    group (newest snapshot first, default before longterm).
+#  - IMAGE_ID is the menu sort-key: "1-uki-current" and "2-uki-previous" sort
+#    before sdbootutil's "opensuse-tumbleweed" and "snapper-..." entries.
+make_osrel() { # snapshot role label output
+    local src=/.snapshots/$1/snapshot/usr/lib/os-release name
+    [[ -f $src ]] || src=/usr/lib/os-release
+    # shellcheck disable=SC1090
+    name=$(set +u; . "$src"; printf '%s %s' "${NAME#openSUSE }" "${VERSION_ID:-}")
+    [[ $2 == current ]] || name=$3
+    {
+        grep -vE '^(PRETTY_NAME|IMAGE_ID|IMAGE_VERSION)=' "$src" || :
+        printf 'PRETTY_NAME="UKI: %s (%s)"\n' "${name% }" "$E_KVER"
+        printf 'IMAGE_ID=%s\n' "$([[ $2 == current ]] && echo 1-uki-current || echo 2-uki-previous)"
+        printf 'IMAGE_VERSION=%s_%s\n' "$1" "$E_KVER"
+    } >"$4"
+}
+
+# Changes whenever anything that goes into the UKI changes. sdbootutil names
+# kernels and initrds by content hash, so path+size+mtime is enough there.
+fingerprint() {
+    local i s
+    {
+        echo "linux $(stat -c '%n %s %Y' "$ESP$E_LINUX")"
+        for i in "${E_INITRDS[@]}"; do echo "initrd $(stat -c '%n %s %Y' "$ESP$i")"; done
+        echo "options $E_OPTIONS"
+        echo "uname $E_KVER"
+        echo "osrel $(sha256sum <"$1")"
+        echo "cert $(sha256sum <"$CERT")"
+        for s in /usr/lib/systemd/boot/efi/linux*.efi.stub; do
+            if [[ -f $s ]]; then echo "stub $(stat -c '%n %s %Y' "$s")"; fi
+        done
+    } | sha256sum | cut -d' ' -f1
+}
+
+build_uki() {
+    local out=$1 osrel=$2 i
+    local -a args=(build --config=/dev/null --linux="$ESP$E_LINUX")
+    for i in "${E_INITRDS[@]}"; do args+=(--initrd="$ESP$i"); done
+    args+=(--cmdline="$E_OPTIONS" --uname="$E_KVER" --os-release="@$osrel"
+           --signtool=sbsign --secureboot-private-key="$KEY"
+           --secureboot-certificate="$CERT" --output="$out")
+    ukify "${args[@]}" >/dev/null || return 1
+    sbverify --cert "$CERT" "$out" >/dev/null || return 1
+}
+
+# Copy to a hidden .tmp name first; systemd-boot only picks up *.efi, and the
+# old UKI stays in place until the new one is complete.
+install_uki() {
+    local built=$1 name=$2 tmp=$UKIDIR/.$2.tmp need avail
+    need=$(( $(stat -c %s "$built") + MARGIN_MIB * 1024 * 1024 ))
+    avail=$(df --output=avail -B1 "$ESP" | tail -n1)
+    (( avail >= need )) || { warn "not enough space on $ESP for $name"; return 1; }
+    cp "$built" "$tmp" || return 1
+    sync -f "$tmp"
+    mv -f "$tmp" "$UKIDIR/$name" || return 1
+    sync -f "$UKIDIR/$name"
+}
+
+# Remove managed files whose names are not among the arguments.
+prune() {
+    local f base keep
+    for f in "$UKIDIR/$PREFIX"-*.efi "$UKIDIR/.$PREFIX"-*.tmp; do
+        [[ -e $f ]] || continue
+        base=${f##*/}
+        for keep in "$@"; do [[ $base == "$keep" ]] && continue 2; done
+        if [[ $MODE == plan ]]; then
+            echo "remove  $base"
+        else
+            rm -f -- "$f" "$STATE/$base.fp"
+            log "removed $base"
+        fi
+    done
+}
+
+# Snapshot numbers that sdbootutil has boot entries for.
+entry_snapshots() {
+    sed -n 's/^version[[:space:]]\+\([0-9]\+\)@.*/\1/p' "$ENTRIES/$MID"-*.conf 2>/dev/null | sort -un
+}
+
+# sdbootutil has no locking of its own, so never run it while zypper holds
+# its lock or another sdbootutil (e.g. from snapper's plugin) is running.
+busy() {
+    local pid
+    pid=$(tr -dc 0-9 </run/zypp.pid 2>/dev/null || :)
+    if [[ -n $pid && -d /proc/$pid ]]; then return 0; fi
+    pgrep -f 'bin/sdbootutil( |$)' >/dev/null
+}
+
+wait_until_idle() {
+    local i
+    for ((i = 0; i < 120; i++)); do
+        busy || return 0
+        sleep 5
+    done
+    return 1
+}
+
+# Remove sdbootutil's boot entries for every zypper/YaST pre/post snapshot
+# that is not among the arguments. The snapshots themselves stay; only their
+# boot entries go (sdbootutil also frees kernels/initrds nothing else uses).
+# "single" snapshots (rollback copies, manual ones) are never touched.
+unboot_others() {
+    local snap type info
+    local -A keep=()
+    for snap in "$@"; do keep[$snap]=1; done
+    while read -r snap; do
+        [[ -z ${keep[$snap]:-} ]] || continue
+        info=/.snapshots/$snap/info.xml
+        [[ -f $info ]] || continue
+        type=$(xml_field "$info" type)
+        [[ $type == pre || $type == post ]] || continue
+        if [[ $MODE == plan ]]; then
+            echo "unboot  snapshot $snap ($type)"
+            continue
+        fi
+        if ! wait_until_idle; then
+            warn "zypper or sdbootutil still busy after 10 minutes; boot entries of $snap left in place"
+            return 0
+        fi
+        if sdbootutil remove-all-kernels --disable-predictions "$snap" >/dev/null; then
+            log "removed boot entries of snapshot $snap"
+        else
+            warn "sdbootutil remove-all-kernels $snap failed"
+        fi
+    done < <(entry_snapshots)
+}
+
+efi_default() {
+    [[ -r $DEFAULT_VAR ]] || return 0
+    tail -c +5 "$DEFAULT_VAR" | iconv -f UTF-16LE -t UTF-8 2>/dev/null | tr -d '\0' || :
+}
+
+# ---- main -------------------------------------------------------------------
+case $MODE in sync|plan) ;; *) echo "usage: ${0##*/} [sync|plan]" >&2; exit 2 ;; esac
+(( EUID == 0 )) || die "must be run as root"
+mountpoint -q "$ESP" || die "$ESP is not mounted"
+[[ -d $ENTRIES ]] || die "$ENTRIES not found"
+[[ -r $KEY && -r $CERT ]] || die "cannot read $KEY or $CERT"
+for c in btrfs ukify sbsign sbverify bootctl; do
+    command -v "$c" >/dev/null || die "$c not found"
+done
+
+exec 9>"$LOCK"
+flock -w 900 9 || die "another run did not finish within 15 minutes"
+mkdir -p "$STATE" "$UKIDIR"
+WORK=$(mktemp -d /var/tmp/uki-snapshots.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+# Content of sdbootutil's entries, to notice changes made while we ran.
+entries_sig() {
+    local f
+    for f in "$ENTRIES"/*.conf; do if [[ -f $f ]]; then echo "$f"; cat "$f"; fi; done | sha256sum
+}
+
+run() {
+    cur=$(current_snapshot)
+    mapfile -t prev < <(previous_snapshots "$cur")
+    log "current snapshot $cur; previous: ${prev[*]:-none}"
+
+    names=() snaps=() entries=() labels=() default_name=''
+    for snap in "$cur" "${prev[@]}"; do
+        if [[ $snap == "$cur" ]]; then
+            label=''
+        else
+            when=$(xml_field "/.snapshots/$snap/info.xml" date)
+            label="#$snap before update $(date -d "$when UTC" '+%m-%d %H:%M' 2>/dev/null || echo "$when UTC")"
+        fi
+        for flavor in "${FLAVORS[@]}"; do
+            entry=$(pick_entry "$snap" "$flavor")
+            if [[ -z $entry ]]; then
+                log "no $flavor kernel entry for snapshot $snap"
+                continue
+            fi
+            parse_entry "$entry"
+            if ! check_entry "$snap"; then
+                warn "skipping unusable entry ${entry##*/}"
+                continue
+            fi
+            name=$PREFIX-$snap-$E_KVER.efi
+            names+=("$name") snaps+=("$snap") entries+=("$entry") labels+=("$label")
+            if [[ $snap == "$cur" && $flavor == "$DEFAULT_FLAVOR" ]]; then
+                default_name=$name
+            fi
+        done
+    done
+
+    # Free space first, but never delete whatever the firmware default points at.
+    olddefault=$(efi_default)
+    prune "${names[@]}" "$olddefault"
+
+    for i in "${!names[@]}"; do
+        name=${names[i]}
+        parse_entry "${entries[i]}"
+        role=previous; [[ ${snaps[i]} == "$cur" ]] && role=current
+        make_osrel "${snaps[i]}" "$role" "${labels[i]}" "$WORK/os-release"
+        fp=$(fingerprint "$WORK/os-release")
+        if [[ -f $UKIDIR/$name && -f $STATE/$name.fp && $(<"$STATE/$name.fp") == "$fp" ]]; then
+            if [[ $MODE == plan ]]; then echo "keep    $name"; fi
+            continue
+        fi
+        if [[ $MODE == plan ]]; then
+            echo "build   $name  (from ${entries[i]##*/})"
+            continue
+        fi
+        if build_uki "$WORK/$name" "$WORK/os-release" && install_uki "$WORK/$name" "$name"; then
+            echo "$fp" >"$STATE/$name.fp"
+            log "installed $name"
+        else
+            warn "failed to build or install $name"
+        fi
+        rm -f "$WORK/$name"
+    done
+
+    if [[ $SET_DEFAULT == yes && -n $default_name && $olddefault != "$default_name" ]]; then
+        if [[ $MODE == plan ]]; then
+            echo "default $default_name  (currently: ${olddefault:-unset})"
+        elif [[ -f $UKIDIR/$default_name ]]; then
+            if bootctl set-default "$default_name" >/dev/null; then
+                log "default boot entry is now $default_name"
+                olddefault=$default_name
+            else
+                warn "bootctl set-default $default_name failed"
+            fi
+        else
+            warn "$default_name is missing; default boot entry left at ${olddefault:-unset}"
+        fi
+    fi
+
+    # Second pass: the previous default may be unneeded now.
+    if [[ $MODE == sync ]]; then prune "${names[@]}" "$olddefault"; fi
+
+    # The UKI sources (current + selected previous) keep their entries.
+    if [[ $UNBOOT_OTHERS == yes ]]; then unboot_others "$cur" "${prev[@]}"; fi
+}
+
+if [[ $MODE == plan ]]; then
+    run
+else
+    # sdbootutil may still be writing entries (e.g. mid-transaction); repeat
+    # until they are the same before and after a run.
+    for attempt in 1 2 3 4 5; do
+        before=$(entries_sig)
+        run
+        [[ $(entries_sig) == "$before" ]] && break
+        log "boot entries changed during run $attempt; syncing again"
+    done
+fi
+
+exit "$FAILED"
