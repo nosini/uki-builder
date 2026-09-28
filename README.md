@@ -96,10 +96,11 @@ only ever runs there, never against a snapshot or anything on the ESP.
   `sdbootutil remove-all-kernels --disable-predictions N`. The snapshots
   themselves stay. `single` snapshots are never touched.
 - **Triggers.**
-  - `uki-snapshots.path` watches the rpm database (every zypper
-    transaction), `/etc/crypttab`, `/etc/dracut.conf.d` and
-    `/etc/kernel/cmdline`, sdbootutil's `loader/entries` (rollbacks, for as
-    long as sdbootutil is active) and `EFI/Linux`.
+  - `uki-snapshots.path` watches `/.snapshots` (snapshots created or
+    deleted, rollbacks), the rpm database's `Packages.db`,
+    `/etc/crypttab`, `/etc/dracut.conf.d`, `/etc/kernel/cmdline`,
+    sdbootutil's `loader/entries` (for as long as sdbootutil is active) and
+    `EFI/Linux`.
   - The service also runs after every `snapper-cleanup.service` and once per
     boot.
   - `sync` repeats (up to 5 times) until the default subvolume, the snapshot
@@ -155,7 +156,11 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
    changes many times per transaction) hits that at once. The
    `ExecStartPre=sleep 5` keeps this service well below it; keep it, or set
    `StartLimitIntervalSec=0`.
-7. **`reproducible=yes` comes from the ostree package**
+7. **Watch `Packages.db`, not the rpm directory.** rpm's ndb backend
+   rewrites `Index.db` (`CLOSE_WRITE`) on every root rpm query, so a
+   watch on the directory fires without any package change. `Packages.db`
+   only changes in a transaction.
+8. **`reproducible=yes` comes from the ostree package**
    (`/etc/dracut.conf.d/ostree.conf`, which also adds dracut's `ostree`
    module), so the script passes `--reproducible` itself.
 
@@ -170,7 +175,7 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
 
 ## Install
 
-    sudo make install          # script + units, daemon-reload, enable the .path (now) and the service
+    sudo make install          # script + units, daemon-reload, enable both, (re)start the .path
     sudo /usr/local/sbin/uki-snapshots plan
     sudo systemctl start uki-snapshots.service
 

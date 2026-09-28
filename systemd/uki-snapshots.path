@@ -2,9 +2,11 @@
 Description=Watch the rpm database and boot configuration to keep signed UKIs in sync
 
 [Path]
-# every zypper transaction (and with it every pre snapshot) changes the rpm
-# database; the service waits for zypper to finish
-PathChanged=/usr/lib/sysimage/rpm
+# snapshots created (zypper pre/post, rollback) or deleted
+PathChanged=/.snapshots
+# packages installed or removed (not the whole directory: Index.db is
+# rewritten by every root rpm query); the service waits for zypper to finish
+PathChanged=/usr/lib/sysimage/rpm/Packages.db
 # what goes into the initrd and the command line
 PathChanged=/etc/crypttab
 PathChanged=/etc/dracut.conf.d

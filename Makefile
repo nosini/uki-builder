@@ -17,7 +17,8 @@ install:
 	install -D -m 0644 systemd/uki-snapshots.service $(DESTDIR)$(UNITDIR)/uki-snapshots.service
 ifeq ($(DESTDIR),)
 	$(SYSTEMCTL) daemon-reload
-	$(SYSTEMCTL) enable --now uki-snapshots.path
+	$(SYSTEMCTL) enable uki-snapshots.path
+	$(SYSTEMCTL) restart uki-snapshots.path
 	$(SYSTEMCTL) enable uki-snapshots.service
 endif
 
