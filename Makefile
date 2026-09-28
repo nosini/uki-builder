@@ -8,6 +8,8 @@ all: check
 
 check:
 	shellcheck bin/uki-snapshots
+	shellcheck -s bash tests/helpers.bash
+	bats tests/
 
 install:
 	install -D -m 0755 bin/uki-snapshots $(DESTDIR)$(SBINDIR)/uki-snapshots
@@ -16,12 +18,13 @@ install:
 ifeq ($(DESTDIR),)
 	$(SYSTEMCTL) daemon-reload
 	$(SYSTEMCTL) enable --now uki-snapshots.path
+	$(SYSTEMCTL) enable uki-snapshots.service
 endif
 
 uninstall:
 ifeq ($(DESTDIR),)
 	-$(SYSTEMCTL) disable --now uki-snapshots.path
-	-$(SYSTEMCTL) stop uki-snapshots.service
+	-$(SYSTEMCTL) disable --now uki-snapshots.service
 endif
 	rm -f $(DESTDIR)$(SBINDIR)/uki-snapshots
 	rm -f $(DESTDIR)$(UNITDIR)/uki-snapshots.path $(DESTDIR)$(UNITDIR)/uki-snapshots.service

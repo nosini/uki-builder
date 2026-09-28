@@ -1,8 +1,15 @@
 [Unit]
-Description=Watch boot entries and UKIs to keep signed UKIs in sync
+Description=Watch the rpm database and boot configuration to keep signed UKIs in sync
 
 [Path]
-# sdbootutil changes these on snapshots, kernel/initrd updates and rollbacks
+# every zypper transaction (and with it every pre snapshot) changes the rpm
+# database; the service waits for zypper to finish
+PathChanged=/usr/lib/sysimage/rpm
+# what goes into the initrd and the command line
+PathChanged=/etc/crypttab
+PathChanged=/etc/dracut.conf.d
+PathChanged=/etc/kernel/cmdline
+# sdbootutil rewrites its entries on rollbacks (as long as it is active)
 PathChanged=/boot/efi/loader/entries
 # rebuild quickly if a UKI goes missing
 PathChanged=/boot/efi/EFI/Linux
