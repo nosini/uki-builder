@@ -94,13 +94,21 @@ only ever runs there, never against a snapshot or anything on the ESP.
 - **Triggers.**
   - `uki-snapshots.path` watches `/.snapshots` (snapshots created or
     deleted, rollbacks), the rpm database's `Packages.db`,
-    `/etc/crypttab`, `/etc/dracut.conf.d`, `/etc/kernel/cmdline` and
+    `/etc/crypttab`, `/etc/dracut.conf.d`, `/etc/kernel/cmdline`,
+    `/usr/lib/systemd/boot/efi` (systemd-boot and its stubs) and
     `EFI/Linux`.
   - The service also runs after every `snapper-cleanup.service` and once per
     boot.
   - `sync` repeats (up to 5 times) until the default subvolume, the snapshot
     list and the rpm database stay the same during a run. Only
     the last run's warnings decide the exit status.
+- **Boot loader** (`SDBOOT_DEST`, off by default): systemd-boot from the
+  running system, signed with the same key, is installed at every ESP path
+  listed. The firmware can then boot it directly, without shim. It is
+  signed again when systemd-boot or the certificate changes.
+- **db alarm** (`DB_FORBIDDEN`, off by default): the service fails with a
+  warning if the Secure Boot db contains one of the named certificates
+  again, e.g. after a db update that Microsoft signed with its KEK.
 - **Read-only snapshot boots** (recovery) do nothing: that snapshot's older
   ukify and stub would otherwise rebuild every UKI.
 
@@ -119,6 +127,8 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
     FLAVORS=(default)
     KEY=/root/keys/db.key
     CERT=/root/keys/db.pem
+    SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi EFI/BOOT/BOOTX64.EFI)
+    DB_FORBIDDEN=('Microsoft Corporation UEFI CA 2011' 'Microsoft UEFI CA 2023')
 
 ## Pitfalls (keep these fixes)
 

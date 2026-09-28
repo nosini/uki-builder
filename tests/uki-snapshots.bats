@@ -206,3 +206,48 @@ security=selinux" >"$T/snapshots/971/snapshot/etc/kernel/cmdline"
     [[ $output == *"still busy"* ]]
     [ ! -s "$T/calls" ]
 }
+
+@test "systemd-boot: signed with our key, installed, re-signed after an update" {
+    echo "openSUSE signature" >>"$T/stubs/systemd-bootx64.efi"
+    echo 'SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi EFI/BOOT/BOOTX64.EFI)' >>"$T/conf"
+    run uki plan
+    [[ $output == *"sign    systemd-bootx64.efi -> EFI/BOOT/BOOTX64.EFI"* ]]
+    [ ! -e "$T/esp/EFI/BOOT/BOOTX64.EFI" ]
+
+    run uki sync
+    echo "$output"
+    [ "$status" -eq 0 ]
+    for f in EFI/systemd/systemd-bootx64.efi EFI/BOOT/BOOTX64.EFI; do
+        [ "$(cat "$T/esp/$f")" = "systemd-boot 261
+signed by cert" ]
+    done
+    # signed once, installed twice
+    [ "$(grep -c '^sbsign' "$T/calls")" -eq 1 ]
+
+    : >"$T/calls"
+    uki sync
+    ! grep -q '^sbsign' "$T/calls"
+
+    echo "systemd-boot 262" >"$T/stubs/systemd-bootx64.efi"
+    uki sync
+    grep -qx "systemd-boot 262" "$T/esp/EFI/BOOT/BOOTX64.EFI"
+}
+
+@test "systemd-boot is left alone unless SDBOOT_DEST is set" {
+    run uki sync
+    [ "$status" -eq 0 ]
+    ! grep -q -e '^sbsign' -e '^sbattach' "$T/calls"
+    [ ! -e "$T/esp/EFI/systemd" ]
+}
+
+@test "db alarm: a forbidden certificate in db fails the service" {
+    echo "DB_FORBIDDEN=('Microsoft Corporation UEFI CA 2011' 'Microsoft UEFI CA 2023')" >>"$T/conf"
+    printf 'xxxxCN=Windows UEFI CA 2023\n' >"$T/efivars/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f"
+    run uki sync
+    [ "$status" -eq 0 ]
+
+    printf 'xxxxMicrosoft Corporation UEFI CA 2011\n' >>"$T/efivars/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f"
+    run uki sync
+    [ "$status" -eq 1 ]
+    [[ $output == *'db contains "Microsoft Corporation UEFI CA 2011" again'* ]]
+}

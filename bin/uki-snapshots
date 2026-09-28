@@ -54,6 +54,15 @@ LOCK=/run/uki-snapshots.lock
 ZYPP_PID=/run/zypp.pid
 EFIVARS=/sys/firmware/efi/efivars
 STUBS=/usr/lib/systemd/boot/efi
+SDBOOT=''                    # default: $STUBS/systemd-bootx64.efi
+# ESP paths to install systemd-boot to, signed with KEY for the firmware to
+# boot directly (no shim); empty = leave the boot loader alone.
+#   SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi EFI/BOOT/BOOTX64.EFI)
+SDBOOT_DEST=()
+# Certificates that must not be in db (subject CNs), e.g. the Microsoft
+# 3rd-party UEFI CAs once they are removed; finding one fails the service.
+#   DB_FORBIDDEN=('Microsoft Corporation UEFI CA 2011' 'Microsoft UEFI CA 2023')
+DB_FORBIDDEN=()
 LIVE_ROOT=''                 # the running system's root, for tests
 # -----------------------------------------------------------------------------
 
@@ -61,8 +70,10 @@ CONF=${UKI_SNAPSHOTS_CONF:-/etc/uki-snapshots.conf}
 # shellcheck source=/dev/null
 if [[ -f $CONF ]]; then . "$CONF"; fi
 
+SDBOOT=${SDBOOT:-$STUBS/systemd-bootx64.efi}
 UKIDIR=$ESP/EFI/Linux
 DEFAULT_VAR=$EFIVARS/LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+DB_VAR=$EFIVARS/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f
 MODE=${1:-sync}
 FAILED=0
 
@@ -296,17 +307,85 @@ build_uki() { # output kernel initrd cmdline kver osrel
     sbverify --cert "$CERT" "$1" >/dev/null 2>&1 || { log "sbverify failed for $1"; return 1; }
 }
 
-# Copy to a hidden .tmp name first; systemd-boot only picks up *.efi, and the
-# old UKI stays in place until the new one is complete.
-install_uki() {
-    local built=$1 name=$2 tmp=$UKIDIR/.$2.tmp need avail
+# Copy to a hidden .tmp name next to the destination first; systemd-boot
+# only picks up *.efi, and the old file stays in place until the new one is
+# complete.
+install_file() {
+    local built=$1 dest=$2 tmp need avail
+    tmp=$(dirname "$dest")/.${dest##*/}.tmp
     need=$(( $(stat -c %s "$built") + MARGIN_MIB * 1024 * 1024 ))
     avail=$(df --output=avail -B1 "$ESP" | tail -n1)
-    (( avail >= need )) || { warn "not enough space on $ESP for $name"; return 1; }
+    (( avail >= need )) || { warn "not enough space on $ESP for ${dest##*/}"; return 1; }
     cp "$built" "$tmp" || return 1
     sync -f "$tmp"
-    mv -f "$tmp" "$UKIDIR/$name" || return 1
-    sync -f "$UKIDIR/$name"
+    mv -f "$tmp" "$dest" || return 1
+    sync -f "$dest"
+}
+
+# systemd-boot of the running system, signed with KEY. openSUSE's build is
+# signed for shim; the firmware only needs our signature.
+sign_bootloader() {
+    local i
+    cp "$SDBOOT" "$WORK/sdboot-unsigned.efi" || return 1
+    for i in 1 2 3 4; do
+        sbattach --remove "$WORK/sdboot-unsigned.efi" >/dev/null 2>&1 || break
+    done
+    if ! sbsign --key "$KEY" --cert "$CERT" --output "$1" "$WORK/sdboot-unsigned.efi" \
+            >"$WORK/sbsign.log" 2>&1; then
+        cat "$WORK/sbsign.log" >&2
+        return 1
+    fi
+    sbverify --cert "$CERT" "$1" >/dev/null 2>&1 || { log "sbverify failed for $1"; return 1; }
+}
+
+# Install the signed systemd-boot at every SDBOOT_DEST where it is missing
+# or out of date (a new systemd-boot or a new certificate).
+update_bootloader() {
+    local dest fp fpfile
+    [[ ${#SDBOOT_DEST[@]} -gt 0 ]] || return 0
+    if [[ ! -f $SDBOOT ]]; then
+        warn "$SDBOOT not found; boot loader not updated"
+        return 0
+    fi
+    fp=$({ hash <"$SDBOOT"; hash <"$CERT"; } | hash)
+    for dest in "${SDBOOT_DEST[@]}"; do
+        fpfile=$STATE/bootloader-${dest//\//_}.fp
+        if [[ -f $ESP/$dest && -f $fpfile && $(<"$fpfile") == "$fp" ]]; then
+            if [[ $MODE == plan ]]; then echo "keep    $dest"; fi
+            continue
+        fi
+        if [[ $MODE == plan ]]; then
+            echo "sign    ${SDBOOT##*/} -> $dest"
+            continue
+        fi
+        if [[ ! -f $WORK/sdboot.efi ]] && ! sign_bootloader "$WORK/sdboot.efi"; then
+            warn "failed to sign ${SDBOOT##*/}"
+            return 0
+        fi
+        mkdir -p "$(dirname "$ESP/$dest")"
+        if install_file "$WORK/sdboot.efi" "$ESP/$dest"; then
+            echo "$fp" >"$fpfile"
+            log "installed signed ${SDBOOT##*/} as $dest"
+        else
+            warn "failed to install $dest"
+        fi
+    done
+}
+
+# The Secure Boot db must not trust what DB_FORBIDDEN names (a CN appears
+# in plain text in the DER certificate).
+check_db() {
+    local name
+    [[ ${#DB_FORBIDDEN[@]} -gt 0 ]] || return 0
+    if [[ ! -r $DB_VAR ]]; then
+        warn "cannot read the Secure Boot db"
+        return 0
+    fi
+    for name in "${DB_FORBIDDEN[@]}"; do
+        if grep -qaF -- "$name" "$DB_VAR"; then
+            warn "the Secure Boot db contains \"$name\" again"
+        fi
+    done
 }
 
 # Remove managed files whose names are not among the arguments.
@@ -392,6 +471,9 @@ mountpoint -q "$ESP" || die "$ESP is not mounted"
 for c in btrfs findmnt dracut ukify sbsign sbverify bootctl; do
     command -v "$c" >/dev/null || die "$c not found"
 done
+if [[ ${#SDBOOT_DEST[@]} -gt 0 ]]; then
+    command -v sbattach >/dev/null || die "sbattach not found"
+fi
 
 # Booted into a read-only snapshot (recovery): its older ukify and stub would
 # rebuild every UKI. Not "booted != default": after a rollback the running,
@@ -504,7 +586,7 @@ run() {
         fi
         if build_uki "$WORK/$name" "$(snapshot_root "$snap")/usr/lib/modules/$k/vmlinuz" \
                 "${initrds[i]}" "${cmdlines[i]}" "$k" "$WORK/os-release" \
-            && install_uki "$WORK/$name" "$name"; then
+            && install_file "$WORK/$name" "$UKIDIR/$name"; then
             echo "$fp" >"$STATE/$name.fp"
             log "installed $name"
         else
@@ -541,6 +623,9 @@ run() {
         prune "${names[@]}" "${kept[@]}" "$olddefault"
         gc_cache "${LIVE:-}" "${states[@]}"
     fi
+
+    update_bootloader
+    check_db
 }
 
 if [[ $MODE == plan ]]; then

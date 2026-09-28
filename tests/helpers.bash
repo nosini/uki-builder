@@ -14,6 +14,7 @@ setup_system() {
     echo "$MID" >"$T/machine-id"
     echo key >"$T/key"; echo cert >"$T/cert"
     echo stub >"$T/stubs/linuxx64.efi.stub"
+    echo "systemd-boot 261" >"$T/stubs/systemd-bootx64.efi"
     : >"$T/calls"
     echo false >"$T/root_ro"
 
@@ -71,7 +72,21 @@ for a; do
 done
 EOF
     mock sbverify 'exit 0'
-    mock sbsign 'exit 0'
+    # "Signs" by appending the certificate to the image.
+    mock sbsign <<'EOF'
+echo "sbsign $*" >>"$T/calls"
+while [[ $1 == --* ]]; do
+    case $1 in --cert) cert=$2 ;; --output) out=$2 ;; esac
+    shift 2
+done
+{ cat "$1"; echo "signed by $(cat "$cert")"; } >"$out"
+EOF
+    # Removes the "openSUSE signature" our fake systemd-boot may carry.
+    mock sbattach <<'EOF'
+echo "sbattach $*" >>"$T/calls"
+[[ $1 == --remove ]] && grep -q '^openSUSE signature$' "$2" || exit 1
+sed -i '/^openSUSE signature$/d' "$2"
+EOF
     mock mountpoint 'exit 0'
     mock logger 'exit 0'
     mock bootctl <<'EOF'
