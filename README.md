@@ -202,10 +202,13 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
   `sudo efibootmgr --bootnext XXXX && sudo systemctl reboot` (XXXX: its
   number in `efibootmgr`).
 - `/boot/efi/loader/loader.conf` with `auto-entries no` and `editor no`.
-- **Not handled yet:** shim and systemd-boot on the ESP
-  (`EFI/systemd/shim.efi`, which loads `grub.efi` = systemd-boot) are no
-  longer updated. Layer B replaces them with systemd-boot signed with your
-  own key.
+- **The boot loader** is systemd-boot signed with your own key, booted
+  directly by the firmware (no shim). `SDBOOT_DEST` keeps it up to date at
+  `EFI/systemd/systemd-bootx64.efi` (firmware entry "systemd-boot (own
+  key)") and at the fallback path `EFI/BOOT/BOOTX64.EFI`. shim, MokManager
+  and the old `grub.efi`/`fallback.efi` are removed from the ESP, and so is
+  shim's firmware boot entry. Firmware boot order: systemd-boot, the
+  fallback path, Windows Boot Manager.
 
 ## Own Secure Boot keys (Layer B)
 
@@ -281,11 +284,16 @@ systemd-boot menu and pick another one:
 - a previous snapshot ("UKI: #N before update …"), which boots read-only;
   `snapper rollback` from there makes it the default
 
-If none of them boots, use a live USB stick. Unlock and mount the root file
-system, chroot into it, then either run
-`/usr/local/sbin/uki-snapshots sync` or go back to sdbootutil (see
-Uninstall). Once Layer B is in place, a live USB stick only boots if Secure
-Boot is disabled in the firmware setup first, or its keys are reset.
+If none of them boots, use a live USB stick. It only starts after you
+disable Secure Boot in the firmware setup (administrator password) or
+restore the factory keys there. Unlock and mount the root file system,
+chroot into it, then run `/usr/local/sbin/uki-snapshots sync`, or go back
+to sdbootutil (see Uninstall). Afterwards, turn Secure Boot back on, or
+enroll your keys again (`secureboot-keys enroll` in Setup Mode).
+
+Backups of everything removed from the ESP are in
+`/root/esp-backup-layer-a` and `/root/esp-backup-layer-b`. The PK and KEK
+private keys are in `/root/secureboot-owner`; keep an offline copy.
 
 ## Threat model
 
@@ -305,14 +313,25 @@ boot the machine into an unlocked disk.
   editable command line) are left in the menu, the command line editor is
   off, and there is no UEFI shell. The UKIs' embedded command line cannot be
   overridden while Secure Boot is on.
-- **Not closed yet (Layer B):**
-  - The firmware trusts the Microsoft 3rd-party UEFI CA, so an attacker can
-    put their own chain on the ESP: shim with any openSUSE-signed kernel and
-    any initrd, or a live system.
-  - `MokManager.efi` is on the ESP. A key enrolled in MOK, e.g. from such a
-    live system, is trusted by shim.
-  - Any code that runs before unlock can ask the FIDO2 key to unlock the disk
-    (and capture its PIN, if the slot requires one).
+- **Closed by your own keys (Layer B):** the firmware runs only what your
+  key, the Windows CAs or the GPU option ROM hash allow. shim, live systems
+  and anything else signed by the Microsoft 3rd-party CAs are refused. The
+  firmware setup is protected by an administrator password (asked only
+  when entering the setup), so Secure Boot cannot simply be switched off or
+  the keys reset. The db alarm (`DB_FORBIDDEN`) reports if a 3rd-party CA
+  ever appears in db again, e.g. through a db update signed with
+  Microsoft's KEK.
+- **Still open:**
+  - Windows' boot chain is trusted (Windows CAs). A Windows boot manager
+    or a tool signed with them, placed on the ESP, would run. With
+    BitLocker, Windows itself is protected, but the Linux unlock is not
+    involved there.
+  - Nothing proves to you that the boot chain is the expected one before
+    you touch the FIDO2 key. tpm2-totp (a code sealed to the TPM's PCRs,
+    shown at boot and compared with your phone) would add that without
+    letting the TPM unlock the disk.
+  - A CMOS reset (jumper/battery) may clear the administrator password.
+    Whether it also resets the Secure Boot keys depends on the firmware.
 - **Old UKIs stay valid.** Every UKI ever signed boots as long as the key is
   trusted, so an attacker can put back an old one from a copy of the ESP.
 - **Data read from snapshots.** The script runs as root and reads
