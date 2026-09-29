@@ -3,10 +3,11 @@ Description=Build and sign UKIs for the current and previous snapshots
 RequiresMountsFor=/boot/efi /var/lib /var/tmp /.snapshots
 # snapper's cleanup may delete a snapshot that a UKI boots
 After=snapper-cleanup.service
+OnFailure=uki-snapshots-notify.service
 
 [Service]
 Type=oneshot
-# let zypper or sdbootutil finish their batch of changes first
+# let zypper finish its batch of changes first
 ExecStartPre=/usr/bin/sleep 5
 ExecStart=/usr/local/sbin/uki-snapshots sync
 Nice=10

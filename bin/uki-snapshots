@@ -21,8 +21,9 @@
 # (SET_DEFAULT). It expects sdbootutil to be removed: its boot entries load
 # an unsigned initrd from the ESP, and its cleanup deletes UKIs.
 #
-#   uki-snapshots plan   show what would be done; change nothing
-#   uki-snapshots sync   do it (default)
+#   uki-snapshots plan     show what would be done; change nothing
+#   uki-snapshots sync     do it (default)
+#   uki-snapshots notify   tell logged-in users that the last run failed
 #
 # Settings can be overridden in /etc/uki-snapshots.conf (bash syntax).
 
@@ -57,8 +58,14 @@ STUBS=/usr/lib/systemd/boot/efi
 SDBOOT=''                    # default: $STUBS/systemd-bootx64.efi
 # ESP paths to install systemd-boot to, signed with KEY for the firmware to
 # boot directly (no shim); empty = leave the boot loader alone.
-#   SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi EFI/BOOT/BOOTX64.EFI)
+#   SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi)
 SDBOOT_DEST=()
+# Fallback copies, e.g. the removable-media path. They get a new
+# systemd-boot only after the firmware has booted that version once, so a
+# broken update still leaves one that works.
+#   SDBOOT_FALLBACK=(EFI/BOOT/BOOTX64.EFI)
+SDBOOT_FALLBACK=()
+NOTIFY=yes                   # desktop notification when the service fails
 # Certificates that must not be in db (subject CNs), e.g. the Microsoft
 # 3rd-party UEFI CAs once they are removed; finding one fails the service.
 #   DB_FORBIDDEN=('Microsoft Corporation UEFI CA 2011' 'Microsoft UEFI CA 2023')
@@ -74,6 +81,7 @@ SDBOOT=${SDBOOT:-$STUBS/systemd-bootx64.efi}
 UKIDIR=$ESP/EFI/Linux
 DEFAULT_VAR=$EFIVARS/LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 DB_VAR=$EFIVARS/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f
+LOADER_INFO_VAR=$EFIVARS/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 MODE=${1:-sync}
 FAILED=0
 
@@ -338,20 +346,44 @@ sign_bootloader() {
     sbverify --cert "$CERT" "$1" >/dev/null 2>&1 || { log "sbverify failed for $1"; return 1; }
 }
 
+# Version a systemd-boot binary reports as LoaderInfo ("systemd-boot 261.2").
+sdboot_version() {
+    grep -ao '#### LoaderInfo: [^#]* ####' "$1" 2>/dev/null | head -n1 \
+        | sed 's/^#### LoaderInfo: \(.*\) ####$/\1/' || :
+}
+
+# Version of the systemd-boot the firmware started this boot.
+booted_sdboot_version() {
+    [[ -r $LOADER_INFO_VAR ]] || return 0
+    tail -c +5 "$LOADER_INFO_VAR" | iconv -f UTF-16LE -t UTF-8 2>/dev/null | tr -d '\0' || :
+}
+
 # Install the signed systemd-boot at every SDBOOT_DEST where it is missing
-# or out of date (a new systemd-boot or a new certificate).
+# or out of date (a new systemd-boot or a new certificate), and at every
+# SDBOOT_FALLBACK once that version has booted (or if the file is missing).
 update_bootloader() {
-    local dest fp fpfile
-    [[ ${#SDBOOT_DEST[@]} -gt 0 ]] || return 0
+    local dest fp fpfile version booted role
+    local -a dests
+    [[ ${#SDBOOT_DEST[@]} -gt 0 || ${#SDBOOT_FALLBACK[@]} -gt 0 ]] || return 0
     if [[ ! -f $SDBOOT ]]; then
         warn "$SDBOOT not found; boot loader not updated"
         return 0
     fi
     fp=$({ hash <"$SDBOOT"; hash <"$CERT"; } | hash)
-    for dest in "${SDBOOT_DEST[@]}"; do
+    version=$(sdboot_version "$SDBOOT")
+    booted=$(booted_sdboot_version)
+    dests=("${SDBOOT_DEST[@]/#/dest:}" "${SDBOOT_FALLBACK[@]/#/fallback:}")
+    for dest in "${dests[@]}"; do
+        role=${dest%%:*} dest=${dest#*:}
         fpfile=$STATE/bootloader-${dest//\//_}.fp
         if [[ -f $ESP/$dest && -f $fpfile && $(<"$fpfile") == "$fp" ]]; then
             if [[ $MODE == plan ]]; then echo "keep    $dest"; fi
+            continue
+        fi
+        if [[ $role == fallback && -f $ESP/$dest && ( -z $version || $version != "$booted" ) ]]; then
+            if [[ $MODE == plan ]]; then
+                echo "hold    $dest  (until ${version:-the new systemd-boot} has booted)"
+            fi
             continue
         fi
         if [[ $MODE == plan ]]; then
@@ -365,7 +397,7 @@ update_bootloader() {
         mkdir -p "$(dirname "$ESP/$dest")"
         if install_file "$WORK/sdboot.efi" "$ESP/$dest"; then
             echo "$fp" >"$fpfile"
-            log "installed signed ${SDBOOT##*/} as $dest"
+            log "installed signed ${SDBOOT##*/} ${version:+($version) }as $dest"
         else
             warn "failed to install $dest"
         fi
@@ -454,6 +486,43 @@ efi_default() {
     tail -c +5 "$DEFAULT_VAR" | iconv -f UTF-16LE -t UTF-8 2>/dev/null | tr -d '\0' || :
 }
 
+# A GVariant string literal, for gdbus.
+gvariant_string() {
+    local s=${1//\\/\\\\}
+    printf "'%s'" "${s//\'/\\\'}"
+}
+
+# Tell every user with an active graphical session that the last run failed
+# (uki-snapshots-notify.service, started by OnFailure=).
+notify_failure() {
+    local id user type active last
+    local -A seen=()
+    [[ $NOTIFY == yes ]] || return 0
+    last=$(journalctl -u uki-snapshots.service -b -o cat -n 300 2>/dev/null \
+        | grep -E '^uki-snapshots: (warning|error): ' | tail -n1 || :)
+    last=${last#uki-snapshots: }
+    while read -r id _; do
+        [[ -n $id ]] || continue
+        type=$(loginctl show-session "$id" -p Type --value 2>/dev/null) || continue
+        active=$(loginctl show-session "$id" -p Active --value 2>/dev/null) || continue
+        user=$(loginctl show-session "$id" -p Name --value 2>/dev/null) || continue
+        [[ $active == yes && ( $type == wayland || $type == x11 ) && -z ${seen[$user]:-} ]] || continue
+        seen[$user]=1
+        if systemd-run --quiet --collect --wait --user --machine="$user@.host" \
+                gdbus call --session --dest org.freedesktop.Notifications \
+                --object-path /org/freedesktop/Notifications \
+                --method org.freedesktop.Notifications.Notify \
+                "'uki-snapshots'" 0 "'dialog-warning'" \
+                "$(gvariant_string "Boot images were not updated")" \
+                "$(gvariant_string "${last:-see journalctl -u uki-snapshots} (journalctl -u uki-snapshots -b)")" \
+                "@as []" "{'urgency': <byte 2>}" 0 >/dev/null 2>&1; then
+            log "notified $user"
+        else
+            log "could not notify $user"
+        fi
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+}
+
 # What a run depends on, cheaply: if it changes during a run, run again.
 world_sig() {
     {
@@ -464,14 +533,18 @@ world_sig() {
 }
 
 # ---- main -------------------------------------------------------------------
-case $MODE in sync|plan) ;; *) echo "usage: ${0##*/} [sync|plan]" >&2; exit 2 ;; esac
+case $MODE in sync|plan|notify) ;; *) echo "usage: ${0##*/} [sync|plan|notify]" >&2; exit 2 ;; esac
 (( EUID == 0 )) || die "must be run as root"
+if [[ $MODE == notify ]]; then
+    notify_failure
+    exit 0
+fi
 mountpoint -q "$ESP" || die "$ESP is not mounted"
 [[ -r $KEY && -r $CERT ]] || die "cannot read $KEY or $CERT"
 for c in btrfs findmnt dracut ukify sbsign sbverify bootctl; do
     command -v "$c" >/dev/null || die "$c not found"
 done
-if [[ ${#SDBOOT_DEST[@]} -gt 0 ]]; then
+if [[ ${#SDBOOT_DEST[@]} -gt 0 || ${#SDBOOT_FALLBACK[@]} -gt 0 ]]; then
     command -v sbattach >/dev/null || die "sbattach not found"
 fi
 

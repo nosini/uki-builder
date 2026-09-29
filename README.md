@@ -21,6 +21,7 @@ root in LUKS2/LVM (unlocked with a FIDO2 key), snapper.
 | `bin/uki-snapshots` | `/usr/local/sbin/uki-snapshots` (its own btrfs subvolume, so it survives rollbacks) |
 | `systemd/uki-snapshots.path` | `/etc/systemd/system/` |
 | `systemd/uki-snapshots.service` | `/etc/systemd/system/` |
+| `systemd/uki-snapshots-notify.service` | `/etc/systemd/system/` (started by `OnFailure=`) |
 | `bin/secureboot-keys` | `/usr/local/sbin/secureboot-keys` (one-time: replace the firmware's Secure Boot keys) |
 | `tests/` | bats tests against a mock system (`make check`) |
 
@@ -103,10 +104,19 @@ only ever runs there, never against a snapshot or anything on the ESP.
   - `sync` repeats (up to 5 times) until the default subvolume, the snapshot
     list and the rpm database stay the same during a run. Only
     the last run's warnings decide the exit status.
-- **Boot loader** (`SDBOOT_DEST`, off by default): systemd-boot from the
-  running system, signed with the same key, is installed at every ESP path
-  listed. The firmware can then boot it directly, without shim. It is
-  signed again when systemd-boot or the certificate changes.
+- **Boot loader** (`SDBOOT_DEST`, `SDBOOT_FALLBACK`, off by default):
+  systemd-boot from the running system, signed with the same key, is
+  installed at every ESP path listed. The firmware can then boot it
+  directly, without shim. It is signed again when systemd-boot or the
+  certificate changes. The `SDBOOT_DEST` copies are updated right away.
+  The `SDBOOT_FALLBACK` copies are only updated once the firmware has
+  booted that version (the `LoaderInfo` variable systemd-boot sets at boot
+  matches the version in the new binary). A systemd-boot update that does
+  not start therefore still leaves a fallback that does.
+- **Notifications** (`NOTIFY=yes`): when the service fails,
+  `uki-snapshots-notify.service` (`OnFailure=`) sends a critical desktop
+  notification with the last warning to every user with an active
+  graphical session, through D-Bus (`gdbus`) in that user's session.
 - **db alarm** (`DB_FORBIDDEN`, off by default): the service fails with a
   warning if the Secure Boot db contains one of the named certificates
   again, e.g. after a db update that Microsoft signed with its KEK.
@@ -128,7 +138,8 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
     FLAVORS=(default)
     KEY=/root/keys/db.key
     CERT=/root/keys/db.pem
-    SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi EFI/BOOT/BOOTX64.EFI)
+    SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi)
+    SDBOOT_FALLBACK=(EFI/BOOT/BOOTX64.EFI)
     DB_FORBIDDEN=('Microsoft Corporation UEFI CA 2011' 'Microsoft UEFI CA 2023')
 
 ## Pitfalls (keep these fixes)
@@ -205,7 +216,8 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
 - **The boot loader** is systemd-boot signed with your own key, booted
   directly by the firmware (no shim). `SDBOOT_DEST` keeps it up to date at
   `EFI/systemd/systemd-bootx64.efi` (firmware entry "systemd-boot (own
-  key)") and at the fallback path `EFI/BOOT/BOOTX64.EFI`. shim, MokManager
+  key)"), and `SDBOOT_FALLBACK` at the fallback path `EFI/BOOT/BOOTX64.EFI`,
+  one version behind until the new one has booted. shim, MokManager
   and the old `grub.efi`/`fallback.efi` are removed from the ESP, and so is
   shim's firmware boot entry. Firmware boot order: systemd-boot, the
   fallback path, Windows Boot Manager. The `shim` package stays installed
@@ -244,13 +256,42 @@ Before that, and in this order:
 
 **The GPU:** an option ROM signed only by the 3rd-party CA (e.g. a graphics card's
 GOP driver) is allowed by its hash. After a GPU firmware update or a new
-card the firmware shows nothing until Linux loads its driver; add the new
-hash (run `secureboot-keys build` again and enroll db) from the running
-system.
+card the firmware shows nothing until Linux loads its driver. If that
+driver is in the initrd (`lsinitrd | grep <driver>`), the screen comes
+back in time for the disk unlock prompt. Then run `secureboot-keys build` again (it picks up the new hash
+from the event log) and enroll as in the first setup.
 
 **Recovery:** the firmware setup can restore the factory keys ("Restore
-Factory Keys" / "Install default Secure Boot keys"), which brings back shim
-and the Microsoft CAs.
+Factory Keys" / "Install default Secure Boot keys"). That brings back the
+Microsoft CAs but not your key, and shim is no longer on the ESP, so
+nothing boots with Secure Boot on until your keys are back (see "BIOS
+updates").
+
+## BIOS updates
+
+A firmware update can reset the Secure Boot keys to the factory
+defaults and forget the firmware boot entries. Your systemd-boot is then
+refused. Afterwards:
+
+1. If the machine does not boot: firmware setup (administrator
+   password), disable Secure Boot, boot Linux.
+2. Firmware setup: Secure Boot → Key Management → "Reset To Setup Mode";
+   decline any offer to install the factory keys.
+3. Linux: `sudo /usr/local/sbin/secureboot-keys enroll` (the files from the
+   last `build` in `/root/secureboot-owner/enroll`; run `build` first if the
+   GPU or its firmware changed).
+4. Firmware setup: enable Secure Boot again.
+5. If "systemd-boot (own key)" is gone from the boot menu, the fallback
+   path `EFI/BOOT/BOOTX64.EFI` still starts it. To recreate the entry:
+   `sudo efibootmgr --create --disk /dev/DISK --part N --label
+   "systemd-boot (own key)" --loader '\EFI\systemd\systemd-bootx64.efi'`,
+   with DISK and N the ESP's disk and partition number (`findmnt /boot/efi`).
+6. Check: `mokutil --sb-state`, `mokutil --pk` (your own PK) and
+   `systemctl is-failed uki-snapshots.service` (`inactive`: the db alarm
+   found nothing).
+
+Also check that the administrator password, and the option that asks for
+it only when entering the setup, survived the update.
 
 ## Install
 

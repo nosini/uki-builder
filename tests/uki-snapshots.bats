@@ -209,8 +209,11 @@ security=selinux" >"$T/snapshots/971/snapshot/etc/kernel/cmdline"
 
 @test "systemd-boot: signed with our key, installed, re-signed after an update" {
     echo "openSUSE signature" >>"$T/stubs/systemd-bootx64.efi"
-    echo 'SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi EFI/BOOT/BOOTX64.EFI)' >>"$T/conf"
+    echo 'SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi)' >>"$T/conf"
+    echo 'SDBOOT_FALLBACK=(EFI/BOOT/BOOTX64.EFI)' >>"$T/conf"
     run uki plan
+    [[ $output == *"sign    systemd-bootx64.efi -> EFI/systemd/systemd-bootx64.efi"* ]]
+    # a missing fallback is installed right away
     [[ $output == *"sign    systemd-bootx64.efi -> EFI/BOOT/BOOTX64.EFI"* ]]
     [ ! -e "$T/esp/EFI/BOOT/BOOTX64.EFI" ]
 
@@ -218,8 +221,9 @@ security=selinux" >"$T/snapshots/971/snapshot/etc/kernel/cmdline"
     echo "$output"
     [ "$status" -eq 0 ]
     for f in EFI/systemd/systemd-bootx64.efi EFI/BOOT/BOOTX64.EFI; do
-        [ "$(cat "$T/esp/$f")" = "systemd-boot 261
-signed by cert" ]
+        grep -qx "signed by cert" "$T/esp/$f"
+        grep -q "systemd-boot 261 " "$T/esp/$f"
+        ! grep -q "openSUSE signature" "$T/esp/$f"
     done
     # signed once, installed twice
     [ "$(grep -c '^sbsign' "$T/calls")" -eq 1 ]
@@ -227,10 +231,29 @@ signed by cert" ]
     : >"$T/calls"
     uki sync
     ! grep -q '^sbsign' "$T/calls"
+}
 
-    echo "systemd-boot 262" >"$T/stubs/systemd-bootx64.efi"
+@test "systemd-boot fallback waits until the new version has booted" {
+    echo 'SDBOOT_DEST=(EFI/systemd/systemd-bootx64.efi)' >>"$T/conf"
+    echo 'SDBOOT_FALLBACK=(EFI/BOOT/BOOTX64.EFI)' >>"$T/conf"
+    booted_sdboot 261
     uki sync
-    grep -qx "systemd-boot 262" "$T/esp/EFI/BOOT/BOOTX64.EFI"
+    grep -q "systemd-boot 261 " "$T/esp/EFI/BOOT/BOOTX64.EFI"
+
+    # an update: the main copy right away, the fallback held back
+    sdboot_release 262
+    run uki plan
+    [[ $output == *"hold    EFI/BOOT/BOOTX64.EFI  (until systemd-boot 262 has booted)"* ]]
+    run uki sync
+    [ "$status" -eq 0 ]
+    grep -q "systemd-boot 262 " "$T/esp/EFI/systemd/systemd-bootx64.efi"
+    grep -q "systemd-boot 261 " "$T/esp/EFI/BOOT/BOOTX64.EFI"
+
+    # after a boot with 262 the fallback follows
+    booted_sdboot 262
+    run uki sync
+    [ "$status" -eq 0 ]
+    grep -q "systemd-boot 262 " "$T/esp/EFI/BOOT/BOOTX64.EFI"
 }
 
 @test "systemd-boot is left alone unless SDBOOT_DEST is set" {
@@ -250,4 +273,35 @@ signed by cert" ]
     run uki sync
     [ "$status" -eq 1 ]
     [[ $output == *'db contains "Microsoft Corporation UEFI CA 2011" again'* ]]
+}
+
+@test "notify: a desktop notification for each user with a graphical session" {
+    mock loginctl <<'EOF'
+case "$*" in
+"list-sessions --no-legend") printf ' 2 1000 alice seat0 tty2\n 5 1001 bob - pts/0\n 7 1000 alice seat0 tty3\n' ;;
+"show-session 2 -p Type --value"|"show-session 7 -p Type --value") echo wayland ;;
+"show-session 5 -p Type --value") echo tty ;;
+*"-p Active --value") echo yes ;;
+"show-session 2 -p Name --value"|"show-session 7 -p Name --value") echo alice ;;
+"show-session 5 -p Name --value") echo bob ;;
+esac
+EOF
+    mock journalctl "echo \"uki-snapshots: warning: dracut failed for $KDEF\""
+    mock systemd-run 'echo "systemd-run $*" >>"$T/calls"'
+
+    run uki notify
+    echo "$output"
+    [ "$status" -eq 0 ]
+    # alice once (two sessions), bob not (no graphical session)
+    [ "$(grep -c '^systemd-run' "$T/calls")" -eq 1 ]
+    grep -q -- "--machine=alice@.host" "$T/calls"
+    grep -q "'warning: dracut failed for $KDEF (journalctl -u uki-snapshots -b)'" "$T/calls"
+}
+
+@test "notify: NOTIFY=no stays quiet" {
+    echo 'NOTIFY=no' >>"$T/conf"
+    mock systemd-run 'echo "systemd-run $*" >>"$T/calls"'
+    run uki notify
+    [ "$status" -eq 0 ]
+    [ ! -s "$T/calls" ]
 }

@@ -1,0 +1,6 @@
+[Unit]
+Description=Tell logged-in users that the UKI update failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/uki-snapshots notify

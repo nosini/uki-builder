@@ -17,6 +17,7 @@ install:
 	install -D -m 0755 bin/secureboot-keys $(DESTDIR)$(SBINDIR)/secureboot-keys
 	install -D -m 0644 systemd/uki-snapshots.path $(DESTDIR)$(UNITDIR)/uki-snapshots.path
 	install -D -m 0644 systemd/uki-snapshots.service $(DESTDIR)$(UNITDIR)/uki-snapshots.service
+	install -D -m 0644 systemd/uki-snapshots-notify.service $(DESTDIR)$(UNITDIR)/uki-snapshots-notify.service
 ifeq ($(DESTDIR),)
 	$(SYSTEMCTL) daemon-reload
 	$(SYSTEMCTL) enable uki-snapshots.path
@@ -30,7 +31,8 @@ ifeq ($(DESTDIR),)
 	-$(SYSTEMCTL) disable --now uki-snapshots.service
 endif
 	rm -f $(DESTDIR)$(SBINDIR)/uki-snapshots $(DESTDIR)$(SBINDIR)/secureboot-keys
-	rm -f $(DESTDIR)$(UNITDIR)/uki-snapshots.path $(DESTDIR)$(UNITDIR)/uki-snapshots.service
+	rm -f $(DESTDIR)$(UNITDIR)/uki-snapshots.path $(DESTDIR)$(UNITDIR)/uki-snapshots.service \
+		$(DESTDIR)$(UNITDIR)/uki-snapshots-notify.service
 ifeq ($(DESTDIR),)
 	$(SYSTEMCTL) daemon-reload
 endif

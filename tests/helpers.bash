@@ -14,7 +14,7 @@ setup_system() {
     echo "$MID" >"$T/machine-id"
     echo key >"$T/key"; echo cert >"$T/cert"
     echo stub >"$T/stubs/linuxx64.efi.stub"
-    echo "systemd-boot 261" >"$T/stubs/systemd-bootx64.efi"
+    sdboot_release 261
     : >"$T/calls"
     echo false >"$T/root_ro"
 
@@ -155,3 +155,14 @@ efi_default() {
 }
 
 ukis() { ls "$T/esp/EFI/Linux"; }
+
+# A fake systemd-boot of version V, with the marker it reports as LoaderInfo.
+sdboot_release() {
+    printf 'sd-boot code\n#### LoaderInfo: systemd-boot %s ####\n' "$1" >"$T/stubs/systemd-bootx64.efi"
+}
+
+# The systemd-boot version the firmware booted (LoaderInfo, UTF-16LE).
+booted_sdboot() {
+    { printf '\x06\x00\x00\x00'; printf 'systemd-boot %s\0' "$1" | iconv -t UTF-16LE; } \
+        >"$T/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+}
