@@ -37,14 +37,26 @@ change them offline. Nothing from there goes into an image:
 | initrd | dracut, run on the live system (see below) |
 | os-release | the snapshot's `/usr/lib/os-release`, with the menu fields below |
 
-**Initrds.** The script hashes the "system state": the rpm database plus
-the `/etc` files dracut depends on (`SYSSTATE_PATHS`: crypttab, fstab,
-dracut.conf(.d), modprobe.d, …). Whenever the live system's state has no
-initrd yet, it runs dracut for each kernel of the current snapshot, with
-sdbootutil's arguments (`--reproducible --force --tmpdir /var/tmp`). The
-result goes into `/var/lib/uki-snapshots/initrd/<sha256>.img`, recorded
-under that state (`gen/<state>/<kver>`). If the state changes while dracut
-runs, the result is thrown away.
+**Initrds.** The script hashes the "system state": the rpm database plus the
+`/etc` files dracut depends on (`SYSSTATE_PATHS`: crypttab, fstab,
+dracut.conf(.d), modprobe.d, …). Symlinks, anywhere along a path, are
+followed inside the root they belong to (an absolute link in a snapshot
+points into that snapshot, and `..` never leaves it), and what counts is the
+target's content. A path that does not resolve within 40 links (a loop), or
+a file, link or directory that cannot be read, makes the state unknown: no
+initrd is built or matched for it, that snapshot's existing UKIs stay,
+cached initrds are not cleaned up, and the service reports it. rpm's
+`Index.db` and lock files do not count (`SYSSTATE_EXCLUDE`): rpm rewrites
+the index without any package change. A read-only snapshot's state is cached
+under its btrfs subvolume UUID, since snapper can reuse the number of a
+deleted snapshot.
+
+Whenever the live system's state has no initrd yet, the script runs dracut
+for each kernel of the current snapshot, with sdbootutil's arguments
+(`--reproducible --force --tmpdir /var/tmp`). The result goes into
+`/var/lib/uki-snapshots/initrd/<sha256>.img`, recorded under that state
+(`gen/<state>/<kver>`). If the state changes while dracut runs, the result
+is thrown away.
 
 **Previous snapshots.** A zypper pre snapshot is the system as it was just
 before a transaction. So its state hash finds the initrd built for exactly
@@ -74,13 +86,28 @@ only ever runs there, never against a snapshot or anything on the ESP.
     which puts the current snapshot first.
   - `IMAGE_VERSION` is `<snapshot>_<kver>`.
 - **Incremental.** `/var/lib/uki-snapshots/<name>.fp` holds a content hash
-  of every input: kernel, initrd, command line, uname, os-release, the
-  cert, the systemd stubs and the ukify version. A UKI is rebuilt only when
-  it changes.
+  of every input (kernel, initrd, command line, uname, os-release, the
+  cert, the systemd stubs and the ukify version) and the hash of the file
+  that was installed. A UKI is rebuilt when an input changes, or when the
+  file on the ESP is not the one installed (e.g. an older signed image put
+  back from a copy of the ESP). The same applies to the signed systemd-boot.
+  This reads every UKI once per run (about 700 MB for six, a few seconds);
+  timestamps would be cheaper but prove nothing on an untrusted ESP.
 - **Prune.** Managed `uki-snap-*.efi` files that are no longer wanted are
-  removed, but never the one `LoaderEntryDefault` points at. Pruning runs
-  again after the default has moved. Cached initrds that no wanted snapshot
-  refers to are deleted.
+  removed, but never the one `LoaderEntryDefault` points at, and none of the
+  current snapshot's before the builds. Afterwards only UKIs that this run
+  built or verified stay, plus those whose rebuild failed but that are still
+  the file installed: per kernel flavor, the current snapshot keeps the UKI
+  of its newest kernel or, until that one is built, the newest one it
+  already has that is intact. A file that merely exists on the ESP never
+  counts, and never becomes the default. A flavor whose kernel is gone from
+  the current snapshot loses its UKI; the kernels are looked up first, so a
+  failure later (e.g. a missing `/etc/kernel/cmdline`) never passes for
+  that. `plan` shows the removals of both passes, and knows what the same
+  `sync` run adds first (initrds from dracut, boot loader copies). Cached
+  initrds that no selected snapshot refers to are deleted only after a run
+  that got as far as selecting snapshots and during which nothing changed (a
+  rollback in the middle may need one the run did not select).
 - **Default entry.** `bootctl set-default` points at the current snapshot's
   `DEFAULT_FLAVOR` UKI, and is written only when it changes.
   - If the current snapshot has no UKI (e.g. after a rollback to a snapshot
@@ -91,8 +118,8 @@ only ever runs there, never against a snapshot or anything on the ESP.
     rollback to before the install), its UKI still becomes the default,
     with a warning: run `make install` again after booting it, or its UKIs
     are no longer updated.
-- **dracut failure.** The existing UKI of the current snapshot stays, and
-  stays the default. The service reports the failure.
+- **dracut or build failure.** The current snapshot's existing UKI of that
+  flavor stays, and stays the default. The service reports the failure.
 - **Triggers.**
   - `uki-snapshots.path` watches `/.snapshots` (snapshots created or
     deleted, rollbacks), the rpm database's `Packages.db`,
@@ -112,7 +139,12 @@ only ever runs there, never against a snapshot or anything on the ESP.
   The `SDBOOT_FALLBACK` copies are only updated once the firmware has
   booted that version (the `LoaderInfo` variable systemd-boot sets at boot
   matches the version in the new binary). A systemd-boot update that does
-  not start therefore still leaves a fallback that does.
+  not start therefore still leaves a fallback that does. Every signed
+  binary installed is also kept in `/var/lib/uki-snapshots/bootloader/`,
+  so a held fallback that is no longer the file installed is restored to
+  the version it held (or, without a saved copy, replaced with the current
+  one). The signed binary gets its final name only after signing and
+  verification succeeded.
 - **Notifications** (`NOTIFY=yes`): when the service fails,
   `uki-snapshots-notify.service` (`OnFailure=`) sends a critical desktop
   notification with the last warning to every user with an active
@@ -132,7 +164,13 @@ Usage (run as root, with the full path, because sudo's `secure_path` lacks
 ## Settings
 
 Defaults are at the top of `bin/uki-snapshots`. Override them in
-`/etc/uki-snapshots.conf`, which is sourced as bash, e.g.:
+`/etc/uki-snapshots.conf`. It is sourced as bash and runs as root, so the
+script refuses it unless it is a regular file (anything else is not even
+opened, since a FIFO would block) that belongs to root, is not writable by
+group or others and is not on a FAT file system (the ESP),
+where ownership means nothing. It is opened once and checked and read
+through that same descriptor, so it cannot be swapped in between. The same
+applies to a file named by `UKI_SNAPSHOTS_CONF`. E.g.:
 
     PREVIOUS=3
     FLAVORS=(default)
@@ -178,6 +216,13 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
 8. **`reproducible=yes` comes from the ostree package**
    (`/etc/dracut.conf.d/ostree.conf`, which also adds dracut's `ostree`
    module), so the script passes `--reproducible` itself.
+9. **State format change.** The system state used to be hashed without
+   following symlinks and with `Index.db`; hashes in that format do not
+   match any more. `take_over_legacy` adopts initrds cached under the old
+   hash once, unless symlinks are among the tracked files (the old format
+   recorded only their text, so it proves nothing about their targets; then
+   dracut builds anew). Remove `legacy_sysstate`/`take_over_legacy` once no
+   snapshot from before that version is a previous snapshot any more.
 
 ## System setup (outside this repo)
 
@@ -254,12 +299,13 @@ Before that, and in this order:
 4. have the BitLocker recovery key at hand if Windows uses BitLocker (PCR 7
    changes)
 
-**The GPU:** an option ROM signed only by the 3rd-party CA (e.g. a graphics card's
-GOP driver) is allowed by its hash. After a GPU firmware update or a new
-card the firmware shows nothing until Linux loads its driver. If that
-driver is in the initrd (`lsinitrd | grep <driver>`), the screen comes
-back in time for the disk unlock prompt. Then run `secureboot-keys build` again (it picks up the new hash
-from the event log) and enroll as in the first setup.
+**The GPU:** an option ROM signed only by the 3rd-party CA (e.g. a
+graphics card's GOP driver) is allowed by its hash. After a GPU firmware
+update or a new card the firmware shows nothing until Linux loads its
+driver. If that driver is in the initrd (`lsinitrd | grep <driver>`), the
+screen comes back in time for the disk unlock prompt. Then run
+`secureboot-keys build` again (it picks up the new hash from the event
+log) and enroll as in the first setup.
 
 **Recovery:** the firmware setup can restore the factory keys ("Restore
 Factory Keys" / "Install default Secure Boot keys"). That brings back the
@@ -380,6 +426,14 @@ boot the machine into an unlocked disk.
 - **Data read from snapshots.** The script runs as root and reads
   `info.xml` (with sed), `os-release` (parsed, not sourced) and
   `/etc/kernel/cmdline` from snapshots. These are inside the encryption.
+- **What the ESP still influences.** No file content from the ESP goes
+  into an image. Which files exist there, and whether they match what was
+  installed, does decide what is rebuilt, pruned or kept, and a file put
+  back or removed by an attacker is replaced by the next run. The default
+  entry is read from the firmware variable once per run, so a concurrent
+  change by another tool is not guarded against.
+- **The config file** is run as root: it is an administrator interface,
+  accepted only when it belongs to root and nobody else can write it.
 
 ## License
 

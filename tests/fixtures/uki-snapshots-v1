@@ -50,9 +50,6 @@ DRACUT_ARGS=(--reproducible --force --tmpdir /var/tmp --quiet)   # as sdbootutil
 SYSSTATE_PATHS=(/usr/lib/sysimage/rpm /etc/crypttab /etc/fstab /etc/dracut.conf
     /etc/dracut.conf.d /etc/modprobe.d /etc/modules-load.d /etc/udev/rules.d
     /etc/vconsole.conf /etc/locale.conf)
-# File names in those directories that do not count: locks, and rpm's index,
-# which rpm rewrites from Packages.db.
-SYSSTATE_EXCLUDE=('.*' '__db.*' 'Index.db')
 IDLE_WAIT_MIN=60             # wait this long for zypper to finish
 LOCK=/run/uki-snapshots.lock
 ZYPP_PID=/run/zypp.pid
@@ -76,30 +73,9 @@ DB_FORBIDDEN=()
 LIVE_ROOT=''                 # the running system's root, for tests
 # -----------------------------------------------------------------------------
 
-# The config file is bash, run as root: only root may be able to change it.
-# It is opened once, and checked and read through that same descriptor, so
-# it cannot be swapped in between. Ownership means nothing on FAT (the
-# ESP), so a file there is refused as well.
 CONF=${UKI_SNAPSHOTS_CONF:-/etc/uki-snapshots.conf}
-if [[ -e $CONF || -L $CONF ]]; then
-    # opening a FIFO or device could block: only regular files get opened
-    if [[ ! -f $CONF ]]; then
-        echo "uki-snapshots: error: refusing $CONF: not a regular file" >&2
-        exit 1
-    fi
-    exec {conf_fd}<"$CONF"
-    read -r conf_uid conf_mode < <(stat -L -c '%u %a' "/dev/fd/$conf_fd")
-    conf_fs=$(stat -f -L -c %T "/dev/fd/$conf_fd")
-    if [[ ! -f /dev/fd/$conf_fd || $conf_uid != 0 || $conf_fs == msdos || $conf_fs == vfat ]] \
-            || (( 8#$conf_mode & 8#022 )); then
-        echo "uki-snapshots: error: refusing $CONF: it must be a file owned by root," \
-            "not writable by others, and not on a FAT file system" >&2
-        exit 1
-    fi
-    # shellcheck source=/dev/null
-    . "/dev/fd/$conf_fd"
-    exec {conf_fd}<&-
-fi
+# shellcheck source=/dev/null
+if [[ -f $CONF ]]; then . "$CONF"; fi
 
 SDBOOT=${SDBOOT:-$STUBS/systemd-bootx64.efi}
 UKIDIR=$ESP/EFI/Linux
@@ -168,72 +144,10 @@ snapshot_kernel() {
     if [[ -n $best ]]; then echo "$best"; fi
 }
 
-# Path $2 (absolute within root $1) with every symlink along it followed
-# inside that root, prefixed with the root. An absolute link in a snapshot
-# points into the snapshot, not into the running system; ".." never leaves
-# the root. Fails after 40 links: an unresolved rest could be followed
-# outside the root.
-resolve() {
-    local root=$1 rest=$2 cur='' comp t links=0
-    while [[ -n $rest ]]; do
-        while [[ $rest == /* ]]; do rest=${rest#/}; done
-        [[ -n $rest ]] || break
-        comp=${rest%%/*}
-        if [[ $rest == */* ]]; then rest=${rest#*/}; else rest=''; fi
-        case $comp in
-            .) continue ;;
-            ..) cur=${cur%/*}; continue ;;
-        esac
-        if [[ -L $root$cur/$comp ]]; then
-            if (( ++links > 40 )); then return 1; fi
-            t=$(readlink "$root$cur/$comp") || return 1
-            if [[ $t == /* ]]; then cur=''; fi
-            rest=$t${rest:+/$rest}
-        else
-            cur=$cur/$comp
-        fi
-    done
-    echo "$root${cur:-/}"
-}
-
-# What path $2 below root $1 holds: the hash of the file it resolves to.
-content() {
-    local f
-    f=$(resolve "$1" "$2") || return 1
-    if [[ -f $f ]]; then hash <"$f"; elif [[ -d $f ]]; then echo dir; else echo missing; fi
-}
-
-# Hash of SYSSTATE_PATHS below root $1 ("" = the running system): the
-# contents of every file, symlinks followed inside that root. Fails if a
-# path cannot be resolved: that state is unknown, not "missing".
+# Hash of SYSSTATE_PATHS below root $1 ("" = the running system).
 sysstate() {
-    local root=$1 p f dir x c
-    local -a skip=()
-    for x in "${SYSSTATE_EXCLUDE[@]}"; do skip+=(! -name "$x"); done
-    for p in "${SYSSTATE_PATHS[@]}"; do
-        dir=$(resolve "$root" "$p") || exit 1
-        if [[ -d $dir ]]; then
-            while IFS= read -r -d '' f; do
-                c=$(content "$root" "${dir#"$root"}${f#"$dir"}") || exit 1
-                printf '%s %s\n' "$p${f#"$dir"}" "$c"
-            done < <(find "$dir" -mindepth 1 \( -type f -o -type l \) "${skip[@]}" -print0 | sort -z)
-            # a listing that failed is not an empty directory
-            wait $! || exit 1
-        else
-            c=$(content "$root" "$p") || exit 1
-            printf '%s %s\n' "$p" "$c"
-        fi
-    done | hash
-}
-
-# sysstate in the previous format (Index.db included, symlinks not
-# followed), only to take over initrds cached under it. Remove once no
-# snapshot from before that version is selected any more.
-legacy_sysstate() {
     local root=$1 p f
-    for p in /usr/lib/sysimage/rpm /etc/crypttab /etc/fstab /etc/dracut.conf \
-             /etc/dracut.conf.d /etc/modprobe.d /etc/modules-load.d /etc/udev/rules.d \
-             /etc/vconsole.conf /etc/locale.conf; do
+    for p in "${SYSSTATE_PATHS[@]}"; do
         if [[ -d $root$p && ! -L $root$p ]]; then
             while IFS= read -r -d '' f; do
                 if [[ -L $f ]]; then
@@ -252,76 +166,29 @@ legacy_sysstate() {
     done | hash
 }
 
-# Whether a symlink is among the files the state of root $1 tracks.
-tracks_symlinks() {
-    local p
-    for p in "${SYSSTATE_PATHS[@]}"; do
-        if [[ -L $1$p ]]; then return 0; fi
-        if [[ -d $1$p && -n $(find "$1$p" -type l -print -quit) ]]; then return 0; fi
-    done
-    return 1
-}
-
-# Initrds cached under the state of root $2 in the previous format become
-# the initrds of state $1, if $1 has none. plan only looks them up there.
-# The old format recorded symlinks by their text, not their target, so with
-# symlinks involved it proves nothing, and dracut builds anew instead.
-declare -A LEGACY=()
-take_over_legacy() {
-    local legacy
-    [[ ! -d $STATE/gen/$1 && -d $STATE/gen ]] || return 0
-    if tracks_symlinks "$2"; then return 0; fi
-    legacy=$(legacy_sysstate "$2")
-    [[ -d $STATE/gen/$legacy ]] || return 0
-    if [[ $MODE == sync ]]; then
-        cp -r "$STATE/gen/$legacy" "$STATE/gen/$1"
-        log "took over the initrds of ${2:-/} from the previous state format"
-    else
-        LEGACY[$1]=$legacy
-        echo "take over the initrds of ${2:-/} from the previous state format"
-    fi
-}
-
-# The btrfs subvolume UUID of $1: unlike its number or its creation time,
-# never the same for two snapshots.
-subvol_uuid() {
-    btrfs subvolume show "$1" 2>/dev/null | awk '$1 == "UUID:" { print $2; exit }'
-}
-
 # sysstate of snapshot $1. Read-only snapshots never change, so theirs is
-# cached, keyed by subvolume UUID (snapper can reuse the number of a
-# deleted snapshot).
+# cached, keyed by creation time (snapper can reuse the number of a deleted
+# snapshot).
 snapshot_state() {
-    local root cache=$STATE/sysstate/$1 id cid state
+    local root cache=$STATE/sysstate/$1 stamp cstamp state
     root=$(snapshot_root "$1")
-    id=$(subvol_uuid "$root")
-    if [[ -z $id || $(btrfs property get -ts "$root" ro 2>/dev/null) != ro=true ]]; then
+    if [[ $(btrfs property get -ts "$root" ro 2>/dev/null) != ro=true ]]; then
         sysstate "$root"
         return
     fi
+    stamp=$(stat -c %W "$root")
     if [[ -f $cache ]]; then
-        read -r cid state <"$cache" || :
-        if [[ $cid == "$id" && -n $state ]]; then echo "$state"; return; fi
+        read -r cstamp state <"$cache" || :
+        if [[ $cstamp == "$stamp" && -n $state ]]; then echo "$state"; return; fi
     fi
-    state=$(sysstate "$root") || return 1
-    if [[ $MODE == sync ]]; then echo "$id $state" >"$cache"; fi
+    state=$(sysstate "$root")
+    if [[ $MODE == sync ]]; then echo "$stamp $state" >"$cache"; fi
     echo "$state"
 }
 
-# plan's model of what sync adds in the same run: initrds dracut would
-# build (state/kver), and boot loaders it would store (sha -> source).
-PLANNED_INITRD='(after dracut)'
-declare -A PLAN_GEN=() PLAN_SAVED=()
-
-# Initrd for kernel $2 built for sysstate $1 (or nothing). plan answers
-# PLANNED_INITRD for one dracut would build first.
+# Initrd for kernel $2 built for sysstate $1 (or nothing).
 cached_initrd() {
-    if [[ $MODE == plan && -n ${PLAN_GEN[$1/$2]:-} ]]; then
-        echo "$PLANNED_INITRD"
-        return 0
-    fi
     local sha f=$STATE/gen/$1/$2
-    if [[ ! -d $STATE/gen/$1 && -n ${LEGACY[$1]:-} ]]; then f=$STATE/gen/${LEGACY[$1]}/$2; fi
     [[ -f $f ]] || return 0
     read -r sha <"$f" || return 0
     if [[ -f $STATE/initrd/$sha.img ]]; then echo "$STATE/initrd/$sha.img"; fi
@@ -332,18 +199,12 @@ cached_initrd() {
 update_live_initrds() {
     local flavor k sha after
     local -a made=()
-    if ! LIVE=$(sysstate "$LIVE_ROOT"); then
-        warn "cannot determine the state of the running system (a symlink loop?); no initrds built"
-        LIVE='' LIVE_UNKNOWN=yes
-        return 0
-    fi
-    take_over_legacy "$LIVE" "$LIVE_ROOT"
+    LIVE=$(sysstate "$LIVE_ROOT")
     for flavor in "${FLAVORS[@]}"; do
         k=$(snapshot_kernel "$CUR" "$flavor")
         if [[ -z $k || -n $(cached_initrd "$LIVE" "$k") ]]; then continue; fi
         if [[ $MODE == plan ]]; then
             echo "dracut  $k"
-            PLAN_GEN[$LIVE/$k]=1
             continue
         fi
         log "building initrd for $k"
@@ -356,11 +217,7 @@ update_live_initrds() {
     done
     [[ ${#made[@]} -gt 0 ]] || return 0
     # A transaction that started meanwhile may have mixed old and new files.
-    if ! after=$(sysstate "$LIVE_ROOT"); then
-        warn "state of the running system unknown after dracut; initrds discarded"
-        LIVE='' LIVE_UNKNOWN=yes
-        return 0
-    fi
+    after=$(sysstate "$LIVE_ROOT")
     if [[ $after != "$LIVE" ]]; then
         warn "system changed while dracut ran; initrds discarded"
         return 0
@@ -475,27 +332,18 @@ install_file() {
 
 # systemd-boot of the running system, signed with KEY. openSUSE's build is
 # signed for shim; the firmware only needs our signature.
-sign_bootloader() { # source output
+sign_bootloader() {
     local i
-    cp "$1" "$WORK/sdboot-unsigned.efi" || return 1
+    cp "$SDBOOT" "$WORK/sdboot-unsigned.efi" || return 1
     for i in 1 2 3 4; do
         sbattach --remove "$WORK/sdboot-unsigned.efi" >/dev/null 2>&1 || break
     done
-    # $2 only appears once signing and verification succeeded, so a retry
-    # never takes the output of a failed attempt for a signed binary.
-    rm -f "$2.tmp"
-    if ! sbsign --key "$KEY" --cert "$CERT" --output "$2.tmp" "$WORK/sdboot-unsigned.efi" \
+    if ! sbsign --key "$KEY" --cert "$CERT" --output "$1" "$WORK/sdboot-unsigned.efi" \
             >"$WORK/sbsign.log" 2>&1; then
         cat "$WORK/sbsign.log" >&2
-        rm -f "$2.tmp"
         return 1
     fi
-    if ! sbverify --cert "$CERT" "$2.tmp" >/dev/null 2>&1; then
-        log "sbverify failed for ${2##*/}"
-        rm -f "$2.tmp"
-        return 1
-    fi
-    mv "$2.tmp" "$2"
+    sbverify --cert "$CERT" "$1" >/dev/null 2>&1 || { log "sbverify failed for $1"; return 1; }
 }
 
 # Version a systemd-boot binary reports as LoaderInfo ("systemd-boot 261.2").
@@ -510,110 +358,49 @@ booted_sdboot_version() {
     tail -c +5 "$LOADER_INFO_VAR" | iconv -f UTF-16LE -t UTF-8 2>/dev/null | tr -d '\0' || :
 }
 
-# Every signed boot loader this script installed is also kept in
-# $STATE/bootloader/<sha256>.efi (inside the encryption), so a fallback that
-# was changed on the ESP can be restored to the version it held.
-save_bootloader() { # file sha
-    [[ ! -f $STATE/bootloader/$2.efi ]] || return 0
-    if [[ $MODE == plan ]]; then
-        PLAN_SAVED[$2]=$1
-        return 0
-    fi
-    mkdir -p "$STATE/bootloader"
-    cp "$1" "$STATE/bootloader/.$2.tmp" && mv "$STATE/bootloader/.$2.tmp" "$STATE/bootloader/$2.efi"
-}
-
-# Put back what $2 records as installed at $ESP/$1, from the saved copy.
-restore_bootloader() { # dest fpfile
-    local fp sha saved
-    [[ -f $2 ]] || return 1
-    read -r fp sha <"$2" || return 1
-    saved=$STATE/bootloader/$sha.efi
-    if [[ $MODE == plan && ! -f $saved && -n $sha ]]; then saved=${PLAN_SAVED[$sha]:-$saved}; fi
-    [[ -n $sha && -f $saved && $(hash <"$saved") == "$sha" ]] || return 1
-    if [[ $MODE == plan ]]; then
-        echo "restore $1  (not the file installed there)"
-        return 0
-    fi
-    mkdir -p "$(dirname "$ESP/$1")"
-    if install_file "$saved" "$ESP/$1"; then
-        log "$1 was not the file installed there; restored it"
-    else
-        warn "failed to restore $1"
-    fi
-}
-
 # Install the signed systemd-boot at every SDBOOT_DEST where it is missing
 # or out of date (a new systemd-boot or a new certificate), and at every
 # SDBOOT_FALLBACK once that version has booted (or if the file is missing).
 update_bootloader() {
-    local dest fp fpfile version booted role src=$WORK/sdboot-src.efi signed sha f
-    local -A used=()
+    local dest fp fpfile version booted role
     local -a dests
     [[ ${#SDBOOT_DEST[@]} -gt 0 || ${#SDBOOT_FALLBACK[@]} -gt 0 ]] || return 0
     if [[ ! -f $SDBOOT ]]; then
         warn "$SDBOOT not found; boot loader not updated"
         return 0
     fi
-    # Everything below refers to this one copy, so a systemd-boot update
-    # meanwhile cannot mix one version's fingerprint with another's binary.
-    cp "$SDBOOT" "$src" || { warn "cannot read $SDBOOT"; return 0; }
-    fp=$({ hash <"$src"; hash <"$CERT"; } | hash)
-    signed=$WORK/sdboot-$fp.efi
-    version=$(sdboot_version "$src")
+    fp=$({ hash <"$SDBOOT"; hash <"$CERT"; } | hash)
+    version=$(sdboot_version "$SDBOOT")
     booted=$(booted_sdboot_version)
     dests=("${SDBOOT_DEST[@]/#/dest:}" "${SDBOOT_FALLBACK[@]/#/fallback:}")
     for dest in "${dests[@]}"; do
         role=${dest%%:*} dest=${dest#*:}
         fpfile=$STATE/bootloader-${dest//\//_}.fp
-        if is_current "$ESP/$dest" "$fpfile" "$fp"; then
+        if [[ -f $ESP/$dest && -f $fpfile && $(<"$fpfile") == "$fp" ]]; then
             if [[ $MODE == plan ]]; then echo "keep    $dest"; fi
-            read -r _ sha <"$fpfile"
-            save_bootloader "$ESP/$dest" "$sha"
             continue
         fi
-        if [[ $role == fallback && ( -z $version || $version != "$booted" ) ]]; then
-            if is_intact "$ESP/$dest" "$fpfile"; then
-                if [[ $MODE == plan ]]; then
-                    echo "hold    $dest  (until ${version:-the new systemd-boot} has booted)"
-                fi
-                read -r _ sha <"$fpfile"
-                save_bootloader "$ESP/$dest" "$sha"
-                continue
+        if [[ $role == fallback && -f $ESP/$dest && ( -z $version || $version != "$booted" ) ]]; then
+            if [[ $MODE == plan ]]; then
+                echo "hold    $dest  (until ${version:-the new systemd-boot} has booted)"
             fi
-            # changed on the ESP: put back the version it held, if saved
-            if restore_bootloader "$dest" "$fpfile"; then continue; fi
-            if [[ -f $ESP/$dest ]]; then
-                log "$dest is not the file installed there, and no copy is saved; replacing it without waiting"
-            fi
+            continue
         fi
         if [[ $MODE == plan ]]; then
             echo "sign    ${SDBOOT##*/} -> $dest"
             continue
         fi
-        if [[ ! -f $signed ]] && ! sign_bootloader "$src" "$signed"; then
+        if [[ ! -f $WORK/sdboot.efi ]] && ! sign_bootloader "$WORK/sdboot.efi"; then
             warn "failed to sign ${SDBOOT##*/}"
             return 0
         fi
         mkdir -p "$(dirname "$ESP/$dest")"
-        if install_file "$signed" "$ESP/$dest"; then
-            sha=$(hash <"$signed")
-            echo "$fp $sha" >"$fpfile"
-            save_bootloader "$signed" "$sha"
+        if install_file "$WORK/sdboot.efi" "$ESP/$dest"; then
+            echo "$fp" >"$fpfile"
             log "installed signed ${SDBOOT##*/} ${version:+($version) }as $dest"
         else
             warn "failed to install $dest"
         fi
-    done
-    # saved copies that no destination records any more
-    [[ $MODE == sync ]] || return 0
-    for f in "$STATE"/bootloader-*.fp; do
-        if [[ -f $f ]] && read -r _ sha <"$f"; then used[$sha]=1; fi
-    done
-    for f in "$STATE"/bootloader/*.efi; do
-        [[ -f $f ]] || continue
-        sha=${f##*/} sha=${sha%.efi}
-        if [[ -z ${used[$sha]:-} ]]; then rm -f -- "$f"; fi
     done
 }
 
@@ -633,49 +420,7 @@ check_db() {
     done
 }
 
-# Whether $1 on the ESP is the file that was installed there, per the state
-# file $2 ("<fingerprint> <sha256 of the installed file>"). The ESP is not
-# trusted: only what this script installed counts, not what merely exists.
-is_intact() {
-    local fp sha
-    [[ -f $1 && -f $2 ]] || return 1
-    read -r fp sha <"$2" || return 1
-    [[ -n $sha && $sha == "$(hash <"$1")" ]]
-}
-
-# is_intact, and installed for the inputs with fingerprint $3.
-is_current() {
-    local fp sha
-    is_intact "$1" "$2" || return 1
-    read -r fp sha <"$2"
-    [[ $fp == "$3" ]]
-}
-
-# All intact UKIs of snapshot $1 (names only).
-intact_ukis() {
-    local f
-    for f in "$UKIDIR/$PREFIX-$1-"*.efi; do
-        if [[ -f $f ]] && is_intact "$f" "$STATE/${f##*/}.fp"; then echo "${f##*/}"; fi
-    done
-}
-
-# Newest UKI of snapshot $1 for kernel flavor $2 that is intact (name only).
-existing_uki() {
-    local f best=''
-    for f in "$UKIDIR/$PREFIX-$1-"*"-$2.efi"; do
-        [[ -f $f ]] || continue
-        is_intact "$f" "$STATE/${f##*/}.fp" || continue
-        f=${f##*/}
-        if [[ -z $best || $(printf '%s\n' "$best" "$f" | sort -V | tail -n1) == "$f" ]]; then
-            best=$f
-        fi
-    done
-    if [[ -n $best ]]; then echo "$best"; fi
-}
-
-# Remove managed files whose names are not among the arguments (plan: show
-# each removal once, though prune runs twice).
-declare -A PLAN_REMOVED=()
+# Remove managed files whose names are not among the arguments.
 prune() {
     local f base keep
     for f in "$UKIDIR/$PREFIX"-*.efi "$UKIDIR/.$PREFIX"-*.tmp; do
@@ -685,8 +430,7 @@ prune() {
             if [[ $base == "$keep" ]]; then continue 2; fi
         done
         if [[ $MODE == plan ]]; then
-            if [[ -z ${PLAN_REMOVED[$base]:-} ]]; then echo "remove  $base"; fi
-            PLAN_REMOVED[$base]=1
+            echo "remove  $base"
         else
             rm -f -- "$f" "$STATE/$base.fp"
             log "removed $base"
@@ -823,14 +567,12 @@ WORK=$(mktemp -d /var/tmp/uki-snapshots.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 run() {
-    local snap flavor k state initrd cmdline label when role fp name i f
-    local default_name='' olddefault complete=yes
-    local -a prev names=() snaps=() kvers=() initrds=() cmdlines=() labels=() protect=() held=()
-    local -A want=() good=() planned=()
+    local snap flavor k state initrd cmdline label when role fp name i
+    local default_name='' olddefault
+    local -a prev names=() snaps=() kvers=() initrds=() cmdlines=() labels=() states=() kept=()
 
     read_default
     BOOTED=$(booted_snapshot)
-    GC_STATES=() SELECTED=no
     if [[ $MODE == plan ]]; then
         if busy; then log "note: zypper is running; this may change"; fi
     elif ! wait_until_idle; then
@@ -839,9 +581,8 @@ run() {
     fi
 
     # dracut only runs on the system it builds for.
-    LIVE='' LIVE_UNKNOWN=no
+    LIVE=''
     if [[ $BOOTED == "$CUR" ]]; then update_live_initrds; fi
-    if [[ $LIVE_UNKNOWN == yes ]]; then complete=no; fi
 
     mapfile -t prev < <(previous_snapshots "$CUR")
     log "current snapshot $CUR (booted ${BOOTED:-?}); previous: ${prev[*]:-none}"
@@ -853,30 +594,14 @@ run() {
             when=$(xml_field "$SNAPSHOTS/$snap/info.xml" date)
             label="#$snap before update $(date -d "$when UTC" '+%m-%d %H:%M' 2>/dev/null || echo "$when UTC")"
         fi
-        # The current snapshot's kernels are known before anything below can
-        # fail, so a failure never passes for "kernel gone" (which deletes).
-        if [[ $snap == "$CUR" ]]; then
-            for flavor in "${FLAVORS[@]}"; do
-                k=$(snapshot_kernel "$snap" "$flavor")
-                if [[ -n $k ]]; then want[$flavor]=$PREFIX-$snap-$k.efi; fi
-            done
-        fi
         if [[ $snap == "$CUR" && -n $LIVE ]]; then
             state=$LIVE
-        elif state=$(snapshot_state "$snap"); then
-            take_over_legacy "$state" "$(snapshot_root "$snap")"
         else
-            # Its cached initrds must not be collected as unused, nor its
-            # UKIs pruned: they are still what was built for it.
-            warn "cannot determine the state of snapshot $snap; skipped, its UKIs kept"
-            complete=no
-            mapfile -t -O "${#held[@]}" held < <(intact_ukis "$snap")
-            continue
+            state=$(snapshot_state "$snap")
         fi
-        GC_STATES+=("$state")
+        states+=("$state")
         if ! cmdline=$(make_cmdline "$snap"); then
-            warn "snapshot $snap has no /etc/kernel/cmdline; skipped, its UKIs kept"
-            mapfile -t -O "${#held[@]}" held < <(intact_ukis "$snap")
+            warn "snapshot $snap has no /etc/kernel/cmdline; skipped"
             continue
         fi
         for flavor in "${FLAVORS[@]}"; do
@@ -890,30 +615,29 @@ run() {
             if [[ -z $initrd ]]; then
                 if [[ $MODE == plan && $snap == "$CUR" && -n $LIVE ]]; then
                     echo "build   $name  (after dracut)"
-                    if [[ -f $(snapshot_root "$snap")/usr/lib/os-release ]]; then planned[$name]=1; fi
-                elif [[ $snap == "$CUR" && -n $LIVE ]]; then
-                    warn "no initrd for $k of the running system"
-                else
+                elif [[ $snap == "$CUR" && -f $UKIDIR/$name ]]; then
+                    # Built from trusted inputs of an earlier state: better
+                    # than nothing until dracut succeeds.
+                    warn "no initrd for the current state of $k; keeping $name as it is"
+                elif [[ $snap != "$CUR" || -z $LIVE ]]; then
                     log "no initrd built for the state of snapshot $snap; no UKI for $k"
+                    continue
+                else
+                    continue
                 fi
+                kept+=("$name")
+                if [[ $snap == "$CUR" && $flavor == "$DEFAULT_FLAVOR" ]]; then default_name=$name; fi
                 continue
             fi
             names+=("$name") snaps+=("$snap") kvers+=("$k") initrds+=("$initrd")
             cmdlines+=("$cmdline") labels+=("$label")
-            planned[$name]=1
+            if [[ $snap == "$CUR" && $flavor == "$DEFAULT_FLAVOR" ]]; then default_name=$name; fi
         done
     done
-    # If GC_STATES is complete, the cache may be cleaned up after this run.
-    SELECTED=$complete
 
-    # Free space first. The current snapshot's UKIs stay until their
-    # replacements are built, and whatever the firmware default points at
-    # always stays.
+    # Free space first, but never delete whatever the firmware default points at.
     olddefault=$(efi_default)
-    for f in "$UKIDIR/$PREFIX-$CUR-"*.efi; do
-        if [[ -f $f ]]; then protect+=("${f##*/}"); fi
-    done
-    prune "${names[@]}" "${protect[@]}" "${held[@]}" "$olddefault"
+    prune "${names[@]}" "${kept[@]}" "$olddefault"
 
     for i in "${!names[@]}"; do
         name=${names[i]} snap=${snaps[i]} k=${kvers[i]}
@@ -921,67 +645,27 @@ run() {
         if [[ $snap == "$CUR" ]]; then role=current; fi
         if ! make_osrel "$snap" "$role" "${labels[i]}" "$k" "$WORK/os-release"; then
             warn "snapshot $snap has no os-release; $name skipped"
-            unset "planned[$name]"
             continue
         fi
         fp=$(fingerprint "$(snapshot_root "$snap")/usr/lib/modules/$k/vmlinuz" \
             "${initrds[i]}" "${cmdlines[i]}" "$k" "$WORK/os-release")
-        if is_current "$UKIDIR/$name" "$STATE/$name.fp" "$fp"; then
-            good[$name]=1
+        if [[ -f $UKIDIR/$name && -f $STATE/$name.fp && $(<"$STATE/$name.fp") == "$fp" ]]; then
             if [[ $MODE == plan ]]; then echo "keep    $name"; fi
             continue
         fi
         if [[ $MODE == plan ]]; then
-            if [[ ${initrds[i]} == "$PLANNED_INITRD" ]]; then
-                echo "build   $name  (after dracut)"
-            else
-                echo "build   $name"
-            fi
+            echo "build   $name"
             continue
         fi
         if build_uki "$WORK/$name" "$(snapshot_root "$snap")/usr/lib/modules/$k/vmlinuz" \
                 "${initrds[i]}" "${cmdlines[i]}" "$k" "$WORK/os-release" \
             && install_file "$WORK/$name" "$UKIDIR/$name"; then
-            echo "$fp $(hash <"$WORK/$name")" >"$STATE/$name.fp"
-            good[$name]=1
+            echo "$fp" >"$STATE/$name.fp"
             log "installed $name"
         else
             warn "failed to build or install $name"
         fi
         rm -f "$WORK/$name"
-    done
-
-    # Per kernel flavor, the current snapshot keeps the UKI of its newest
-    # kernel if this run built or verified it, or else the newest one it
-    # already has that is still the file installed. A file that merely
-    # exists on the ESP (the untrusted ESP) never counts.
-    protect=()
-    for flavor in "${FLAVORS[@]}"; do
-        name=${want[$flavor]:-}
-        if [[ -n $name && -z ${good[$name]:-} && ! ( $MODE == plan && -n ${planned[$name]:-} ) ]]; then
-            f=$(existing_uki "$CUR" "$flavor")
-            if [[ -n $f && $f != "$name" ]]; then
-                if [[ $MODE == plan ]]; then
-                    echo "keep    $f  (until $name can be built)"
-                else
-                    warn "keeping $f until $name can be built"
-                fi
-            fi
-            name=$f
-        fi
-        # no kernel of this flavor (any more): its UKIs go
-        if [[ -z $name ]]; then continue; fi
-        protect+=("$name")
-        if [[ $flavor == "$DEFAULT_FLAVOR" ]]; then default_name=$name; fi
-    done
-    # Of the other wanted UKIs, those built or verified this run stay, and
-    # those whose rebuild failed but which are still the installed file
-    # (plan: those it would build).
-    for name in "${names[@]}"; do
-        if [[ -n ${good[$name]:-} || ( $MODE == plan && -n ${planned[$name]:-} ) ]] \
-                || is_intact "$UKIDIR/$name" "$STATE/$name.fp"; then
-            protect+=("$name")
-        fi
     done
 
     # Default entry: the current snapshot's UKI. Without one (e.g. after a
@@ -995,7 +679,6 @@ run() {
     elif [[ $SET_DEFAULT == yes && $olddefault != "$default_name" ]]; then
         if [[ $MODE == plan ]]; then
             echo "default $default_name  (currently: ${olddefault:-unset})"
-            olddefault=$default_name
         elif [[ -f $UKIDIR/$default_name ]]; then
             if bootctl set-default "$default_name" >/dev/null; then
                 log "default boot entry is now $default_name"
@@ -1008,10 +691,11 @@ run() {
         fi
     fi
 
-    # Second pass: superseded UKIs of the current snapshot, files that are
-    # not what was installed, and the previous default (plan shows what it
-    # would remove). Cached initrds are only dropped after a stable run.
-    prune "${protect[@]}" "${held[@]}" "$olddefault"
+    if [[ $MODE == sync ]]; then
+        # Second pass: the previous default may be unneeded now.
+        prune "${names[@]}" "${kept[@]}" "$olddefault"
+        gc_cache "${LIVE:-}" "${states[@]}"
+    fi
 
     update_bootloader
     check_db
@@ -1021,9 +705,7 @@ if [[ $MODE == plan ]]; then
     run
 else
     # Snapshots or the rpm database may change while this runs; repeat until
-    # they stay the same. Only a run that saw no change decides which cached
-    # initrds are still needed: a rollback mid-run may need one the run
-    # before it did not select.
+    # they stay the same.
     stable=no
     for attempt in 1 2 3 4 5; do
         FAILED=0   # a later run retries whatever failed, so only the last counts
@@ -1032,13 +714,7 @@ else
         if [[ $(world_sig) == "$before" ]]; then stable=yes; break; fi
         log "system changed during run $attempt; syncing again"
     done
-    if [[ $stable == yes && $SELECTED == yes ]]; then
-        gc_cache "${LIVE:-}" "${GC_STATES[@]}"
-    elif [[ $stable == yes ]]; then
-        log "run did not get to select snapshots; cached initrds left alone"
-    else
-        warn "system still changing after $attempt runs; cached initrds left alone"
-    fi
+    if [[ $stable == no ]]; then warn "system still changing after $attempt runs"; fi
 fi
 
 exit "$FAILED"

@@ -104,10 +104,7 @@ uki-snap-971-$KDEF.efi" ]
     transaction 972
     uki sync
     # snapper rollback 972: new writable copy 973 becomes the default
-    snapshot 973 single "writable copy of #972"
-    rm -rf "$T/snapshots/973/snapshot"
-    cp -a "$T/snapshots/972/snapshot" "$T/snapshots/973/snapshot"
-    rm "$T/snapshots/973/snapshot/.readonly"
+    copy_snapshot 972 973 single "writable copy of #972"
     echo 973 >"$T/default"
     : >"$T/calls"
 
@@ -125,10 +122,7 @@ uki-snap-971-$KDEF.efi" ]
     uki sync
     transaction 972
     uki sync
-    snapshot 973 single "writable copy of #972"
-    rm -rf "$T/snapshots/973/snapshot"
-    cp -a "$T/snapshots/972/snapshot" "$T/snapshots/973/snapshot"
-    rm "$T/snapshots/973/snapshot/.readonly"
+    copy_snapshot 972 973 single "writable copy of #972"
     rm "$T/snapshots/973/snapshot/etc/systemd/system/paths.target.wants/uki-snapshots.path"
     echo 973 >"$T/default"
 

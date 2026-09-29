@@ -18,6 +18,7 @@ setup_system() {
     : >"$T/calls"
     echo false >"$T/root_ro"
 
+    touch "$T/conf" && chmod 600 "$T/conf"
     cat >"$T/conf" <<EOF
 PATH=$T/bin:/usr/bin:/bin
 ESP=$T/esp
@@ -37,6 +38,7 @@ EOF
     mock btrfs <<'EOF'
 case "$1 $2" in
 "subvolume get-default") echo "ID 300 gen 1 top level 266 path @/.snapshots/$(cat "$T/default")/snapshot" ;;
+"subvolume show") echo "	UUID: 	$(cat "$3/.uuid" 2>/dev/null)" ;;
 "property get")
     if [[ $4 == / ]]; then echo "ro=$(cat "$T/root_ro")"
     elif [[ -e $4/.readonly ]]; then echo ro=true
@@ -65,6 +67,7 @@ EOF
     mock ukify <<'EOF'
 if [[ $1 == --version ]]; then echo "ukify 261"; exit 0; fi
 echo "ukify $*" >>"$T/calls"
+if [[ -e $T/hook ]]; then mv "$T/hook" "$T/hook.ran"; bash "$T/hook.ran"; fi
 for a; do case $a in --output=*) out=${a#--output=} ;; esac; done
 printf '%s\n' "$@" >"$out"
 for a; do
@@ -75,6 +78,7 @@ EOF
     # "Signs" by appending the certificate to the image.
     mock sbsign <<'EOF'
 echo "sbsign $*" >>"$T/calls"
+if [[ -e $T/sign-hook ]]; then mv "$T/sign-hook" "$T/sign-hook.ran"; bash "$T/sign-hook.ran"; fi
 while [[ $1 == --* ]]; do
     case $1 in --cert) cert=$2 ;; --output) out=$2 ;; esac
     shift 2
@@ -125,6 +129,17 @@ snapshot() {
     echo "vmlinuz $KLT" >"$r/usr/lib/modules/$KLT/vmlinuz"
     echo "luks UUID=x none fido2-device=auto,x-initrd.attach" >"$r/etc/crypttab"
     ln -s /etc/systemd/system/uki-snapshots.path "$r/etc/systemd/system/paths.target.wants/uki-snapshots.path"
+    cat /proc/sys/kernel/random/uuid >"$r/.uuid"
+}
+
+# copy_snapshot SRC DST TYPE [DESCRIPTION]: DST as a new subvolume with SRC's
+# contents (a pre snapshot, or snapper rollback's writable copy).
+copy_snapshot() {
+    snapshot "$2" "$3" "${4:-}"
+    rm -rf "$T/snapshots/$2/snapshot"
+    cp -a "$T/snapshots/$1/snapshot" "$T/snapshots/$2/snapshot"
+    rm -f "$T/snapshots/$2/snapshot/.readonly"
+    cat /proc/sys/kernel/random/uuid >"$T/snapshots/$2/snapshot/.uuid"
 }
 
 # A zypper transaction on the live system: the pre snapshot is a read-only
@@ -132,9 +147,7 @@ snapshot() {
 transaction() {
     local pre=$1 live
     live=$T/snapshots/$(<"$T/booted")/snapshot
-    snapshot "$pre" pre "zypp(zypper)"
-    rm -rf "$T/snapshots/$pre/snapshot"
-    cp -a "$live" "$T/snapshots/$pre/snapshot"
+    copy_snapshot "$(<"$T/booted")" "$pre" pre "zypp(zypper)"
     touch "$T/snapshots/$pre/snapshot/.readonly"
     echo "rpm after $pre" >"$live/usr/lib/sysimage/rpm/Packages.db"
 }
