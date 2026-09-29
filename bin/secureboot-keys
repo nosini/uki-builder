@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+"""secureboot-keys - replace the firmware's Secure Boot keys with your own.
+
+Builds the new key set from the machine's current variables and enrolls it
+while the firmware is in Setup Mode:
+
+  PK    your own platform key (created here)
+  KEK   your own key exchange key (created here) + the Microsoft KEKs named
+        in KEEP_KEK, so Windows Update and fwupd can still update dbx
+  db    your signing certificate (the one the UKIs are signed with) + the
+        Microsoft Windows CAs named in KEEP_DB + the hashes of the option
+        ROMs the firmware loaded this boot (from the TPM event log)
+  dbx   unchanged: the current revocations, written back because resetting
+        to Setup Mode may clear them
+
+Everything else in db (the Microsoft 3rd-party UEFI CAs, vendor certs) is
+dropped: shim, and whatever else they sign, no longer runs.
+
+  secureboot-keys build    create PK/KEK if missing; write the lists and the
+                           signed updates to OUT; show what goes where
+  secureboot-keys enroll   write db, dbx, KEK and PK (in this order) from OUT;
+                           only in Setup Mode
+
+Private keys stay in OWNER (root only). Needs openssl and efitools
+(sign-efi-sig-list, efi-updatevar). Paths can be changed with environment
+variables of the same name (used by the tests).
+"""
+
+import os
+import struct
+import subprocess
+import sys
+import uuid
+
+OWNER = os.environ.get("OWNER", "/root/secureboot-owner")
+OUT = os.environ.get("OUT", OWNER + "/enroll")
+DB_CERT = os.environ.get("DB_CERT", "/root/uki-signing/secureboot.pem")
+EFIVARS = os.environ.get("EFIVARS", "/sys/firmware/efi/efivars")
+EVENTLOG = os.environ.get("EVENTLOG", "/sys/kernel/security/tpm0/binary_bios_measurements")
+SIGN = os.environ.get("SIGN", "yes") == "yes"   # no: lists only (tests)
+NAME = os.environ.get("KEY_NAME", os.uname().nodename)
+
+KEEP_KEK = ["Microsoft Corporation KEK CA 2011", "Microsoft Corporation KEK 2K CA 2023"]
+KEEP_DB = ["Microsoft Windows Production PCA 2011", "Windows UEFI CA 2023"]
+
+GLOBAL = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+IMAGE_SECURITY = "d719b2cb-3d3a-4596-a3bc-dad00e67656f"
+VAR_GUID = {"PK": GLOBAL, "KEK": GLOBAL, "db": IMAGE_SECURITY, "dbx": IMAGE_SECURITY}
+SIGNER = {"PK": "PK", "KEK": "PK", "db": "KEK", "dbx": "KEK"}
+
+CERT_X509 = uuid.UUID("a5c059a1-94e4-4aa7-87b5-ab155c2bf072")
+CERT_SHA256 = uuid.UUID("c1c41626-504c-4092-aca9-41f936934328")
+
+
+def die(msg):
+    sys.exit("secureboot-keys: error: " + msg)
+
+
+def read_var(name):
+    """Value of an EFI variable, without the 4-byte attributes."""
+    with open(f"{EFIVARS}/{name}-{VAR_GUID.get(name, GLOBAL)}", "rb") as f:
+        return f.read()[4:]
+
+
+def parse_esl(data):
+    """[(type, owner, data)] of all entries in a list of signature lists."""
+    out, off = [], 0
+    while off + 28 <= len(data):
+        t = uuid.UUID(bytes_le=data[off:off + 16])
+        lsize, hsize, ssize = struct.unpack_from("<III", data, off + 16)
+        body = data[off + 28 + hsize:off + lsize]
+        for i in range(0, len(body), ssize):
+            out.append((t, uuid.UUID(bytes_le=body[i:i + 16]), body[i + 16:i + ssize]))
+        off += lsize
+    return out
+
+
+def build_esl(entries):
+    """Signature lists: one per certificate, one for all hashes."""
+    out = b""
+    for t, owner, data in entries:
+        if t == CERT_X509:
+            size = 16 + len(data)
+            out += (t.bytes_le + struct.pack("<III", 28 + size, 0, size)
+                    + owner.bytes_le + data)
+    hashes = [(o, d) for t, o, d in entries if t == CERT_SHA256]
+    if hashes:
+        out += (CERT_SHA256.bytes_le + struct.pack("<III", 28 + 48 * len(hashes), 0, 48)
+                + b"".join(o.bytes_le + d for o, d in hashes))
+    return out
+
+
+def openssl(*args, data=None):
+    r = subprocess.run(["openssl", *args], input=data, capture_output=True, check=True)
+    return r.stdout
+
+
+def cn(der):
+    subject = openssl("x509", "-inform", "DER", "-noout", "-subject", "-nameopt", "multiline",
+                      data=der).decode()
+    for line in subject.splitlines():
+        if line.strip().startswith("commonName"):
+            return line.split("=", 1)[1].strip()
+    return subject.strip()
+
+
+def pem_to_der(path):
+    return openssl("x509", "-in", path, "-outform", "DER")
+
+
+def option_rom_hashes():
+    """(sha256, device path) of what the firmware loaded from PCI devices
+    (PCR 2 boot services drivers/applications) this boot."""
+    with open(EVENTLOG, "rb") as f:
+        d = f.read()
+    esz = struct.unpack_from("<I", d, 28)[0]
+    spec = d[32:32 + esz]
+    sizes = {}
+    for i in range(struct.unpack_from("<I", spec, 24)[0]):
+        alg, size = struct.unpack_from("<HH", spec, 28 + 4 * i)
+        sizes[alg] = size
+    off, found = 32 + esz, []
+    while off < len(d):
+        pcr, etype, count = struct.unpack_from("<III", d, off)
+        o, digests = off + 12, {}
+        for _ in range(count):
+            alg = struct.unpack_from("<H", d, o)[0]
+            digests[alg] = d[o + 2:o + 2 + sizes[alg]]
+            o += 2 + sizes[alg]
+        esz = struct.unpack_from("<I", d, o)[0]
+        event = d[o + 4:o + 4 + esz]
+        off = o + 4 + esz
+        if pcr == 2 and etype in (0x80000003, 0x80000004) and 0x0B in digests:
+            dplen = struct.unpack_from("<Q", event, 24)[0]
+            found.append((digests[0x0B], device_path(event[32:32 + dplen])))
+    return found
+
+
+def device_path(b):
+    out, i = [], 0
+    while i + 4 <= len(b):
+        t, st, ln = b[i], b[i + 1], struct.unpack_from("<H", b, i + 2)[0]
+        if ln < 4 or t == 0x7F:
+            break
+        n = b[i + 4:i + ln]
+        if t == 1 and st == 1:
+            out.append(f"Pci({n[1]:x},{n[0]:x})")
+        elif t == 2 and st == 1:
+            out.append("PciRoot")
+        else:
+            out.append(f"{t}/{st}")
+        i += ln
+    return "/".join(out)
+
+
+def owner_guid():
+    path = f"{OWNER}/GUID"
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(str(uuid.uuid4()) + "\n")
+    with open(path) as f:
+        return uuid.UUID(f.read().strip())
+
+
+def make_key(name, subject):
+    key, pem = f"{OWNER}/{name}.key", f"{OWNER}/{name}.pem"
+    if os.path.exists(key):
+        return
+    subprocess.run(["openssl", "req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-sha256", "-days", "7300", "-subj", f"/CN={subject}/",
+                    "-keyout", key, "-out", pem], check=True, capture_output=True)
+    os.chmod(key, 0o600)
+    print(f"created {name} key: {subject}")
+
+
+def keep(entries, names, what):
+    kept = []
+    for t, owner, data in entries:
+        if t == CERT_X509 and cn(data) in names:
+            kept.append((t, owner, data))
+    found = {cn(d) for _, _, d in kept}
+    for n in names:
+        if n not in found:
+            die(f'"{n}" is not in the current {what}; refusing to build without it')
+    return kept
+
+
+def describe(name, entries):
+    print(f"{name}:")
+    for t, _, data in entries:
+        if t == CERT_X509:
+            print(f"  cert  {cn(data)}")
+    hashes = [d for t, _, d in entries if t == CERT_SHA256]
+    if hashes:
+        print(f"  {len(hashes)} sha256 hash(es)")
+        if name == "db":
+            for h in hashes:
+                print(f"        {h.hex()}")
+
+
+def build():
+    os.umask(0o077)
+    os.makedirs(OUT, exist_ok=True)
+    guid = owner_guid()
+    make_key("PK", f"{NAME} Secure Boot PK")
+    make_key("KEK", f"{NAME} Secure Boot KEK")
+
+    own = lambda path: (CERT_X509, guid, pem_to_der(path))
+    kek = [own(f"{OWNER}/KEK.pem")] + keep(parse_esl(read_var("KEK")), KEEP_KEK, "KEK")
+    db = [own(DB_CERT)] + keep(parse_esl(read_var("db")), KEEP_DB, "db")
+    roms = option_rom_hashes()
+    db += [(CERT_SHA256, guid, h) for h, _ in roms]
+    lists = {"PK": [own(f"{OWNER}/PK.pem")], "KEK": kek, "db": db,
+             "dbx": parse_esl(read_var("dbx"))}
+
+    for name, entries in lists.items():
+        esl = f"{OUT}/{name}.esl"
+        with open(esl, "wb") as f:
+            # dbx goes back byte for byte, exactly as the firmware has it
+            f.write(read_var("dbx") if name == "dbx" else build_esl(entries))
+        if SIGN:
+            signer = SIGNER[name]
+            subprocess.run(["sign-efi-sig-list", "-g", str(guid),
+                            "-k", f"{OWNER}/{signer}.key", "-c", f"{OWNER}/{signer}.pem",
+                            name, esl, f"{OUT}/{name}.auth"], check=True, capture_output=True)
+        describe(name, entries)
+    for h, path in roms:
+        print(f"option ROM {path}: {h.hex()}")
+    print(f"written to {OUT}; enroll in Setup Mode with: secureboot-keys enroll")
+
+
+def enroll():
+    if read_var("SetupMode") != b"\x01":
+        die("the firmware is not in Setup Mode; reset it to Setup Mode in the firmware setup first")
+    for name in ("db", "dbx", "KEK", "PK"):
+        auth = f"{OUT}/{name}.auth"
+        if not os.path.exists(auth):
+            die(f"{auth} not found; run build first")
+    for name in ("db", "dbx", "KEK", "PK"):
+        var = f"{EFIVARS}/{name}-{VAR_GUID[name]}"
+        if os.path.exists(var):
+            subprocess.run(["chattr", "-i", var], check=False)
+        subprocess.run(["efi-updatevar", "-f", f"{OUT}/{name}.auth", name], check=True)
+        with open(f"{OUT}/{name}.esl", "rb") as f:
+            want = f.read()
+        if read_var(name) != want:
+            die(f"{name} reads back differently than written; stop and check before rebooting")
+        print(f"enrolled {name}")
+    print("SetupMode is now", read_var("SetupMode").hex(), "(00 = user mode, keys active)")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "build":
+        build()
+    elif cmd == "enroll":
+        enroll()
+    else:
+        sys.exit(__doc__)

@@ -21,6 +21,7 @@ root in LUKS2/LVM (unlocked with a FIDO2 key), snapper.
 | `bin/uki-snapshots` | `/usr/local/sbin/uki-snapshots` (its own btrfs subvolume, so it survives rollbacks) |
 | `systemd/uki-snapshots.path` | `/etc/systemd/system/` |
 | `systemd/uki-snapshots.service` | `/etc/systemd/system/` |
+| `bin/secureboot-keys` | `/usr/local/sbin/secureboot-keys` (one-time: replace the firmware's Secure Boot keys) |
 | `tests/` | bats tests against a mock system (`make check`) |
 
 ## What goes into a UKI
@@ -205,6 +206,46 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
   (`EFI/systemd/shim.efi`, which loads `grub.efi` = systemd-boot) are no
   longer updated. Layer B replaces them with systemd-boot signed with your
   own key.
+
+## Own Secure Boot keys (Layer B)
+
+With shim and the Microsoft 3rd-party UEFI CAs trusted, anyone can put
+their own boot chain on the ESP (shim with any openSUSE kernel and initrd,
+or a live system). Layer B makes the firmware trust only your keys, the
+Windows CAs and your GPU's option ROM:
+
+| Variable | Contents |
+| --- | --- |
+| PK | your own platform key |
+| KEK | your own KEK, and Microsoft's KEKs (so Windows Update and fwupd can still update dbx) |
+| db | your signing certificate, Microsoft Windows Production PCA 2011, Windows UEFI CA 2023, the hashes of the option ROMs the firmware loaded (TPM event log) |
+| dbx | unchanged |
+
+`secureboot-keys build` creates PK and KEK in `/root/secureboot-owner`
+(root only; keep an offline backup) and writes the lists and signed
+updates. `secureboot-keys enroll` writes them while the firmware is in
+Setup Mode. Needs `efitools`.
+
+Before that, and in this order:
+1. set a firmware administrator password (otherwise anyone at the keyboard
+   can simply turn Secure Boot off)
+2. add your certificate to db (firmware setup, "Append"), set
+   `SDBOOT_DEST`, add a firmware boot entry for the signed systemd-boot and
+   test it with `efibootmgr --bootnext`
+3. make that entry the first in `BootOrder`, since shim no longer starts
+   once the keys are replaced
+4. have the BitLocker recovery key at hand if Windows uses BitLocker (PCR 7
+   changes)
+
+**The GPU:** an option ROM signed only by the 3rd-party CA (e.g. a graphics card's
+GOP driver) is allowed by its hash. After a GPU firmware update or a new
+card the firmware shows nothing until Linux loads its driver; add the new
+hash (run `secureboot-keys build` again and enroll db) from the running
+system.
+
+**Recovery:** the firmware setup can restore the factory keys ("Restore
+Factory Keys" / "Install default Secure Boot keys"), which brings back shim
+and the Microsoft CAs.
 
 ## Install
 
