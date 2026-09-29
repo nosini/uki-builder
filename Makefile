@@ -9,7 +9,7 @@ all: check
 check:
 	shellcheck bin/uki-snapshots
 	shellcheck -s bash tests/helpers.bash
-	python3 -m py_compile bin/secureboot-keys
+	python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' bin/secureboot-keys
 	bats tests/
 
 install:
