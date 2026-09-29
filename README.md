@@ -208,7 +208,9 @@ Defaults are at the top of `bin/uki-snapshots`. Override them in
   key)") and at the fallback path `EFI/BOOT/BOOTX64.EFI`. shim, MokManager
   and the old `grub.efi`/`fallback.efi` are removed from the ESP, and so is
   shim's firmware boot entry. Firmware boot order: systemd-boot, the
-  fallback path, Windows Boot Manager.
+  fallback path, Windows Boot Manager. The `shim` package stays installed
+  (fwupd and gnome-software require it); with sdbootutil gone nothing
+  copies it to the ESP, and the firmware would refuse it anyway.
 
 ## Own Secure Boot keys (Layer B)
 
