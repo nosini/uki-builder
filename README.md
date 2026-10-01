@@ -416,9 +416,9 @@ boot the machine into an unlocked disk.
     BitLocker, Windows itself is protected, but the Linux unlock is not
     involved there.
   - Nothing proves to you that the boot chain is the expected one before
-    you touch the FIDO2 key. tpm2-totp (a code sealed to the TPM's PCRs,
-    shown at boot and compared with your phone) would add that without
-    letting the TPM unlock the disk.
+    you touch the FIDO2 key. A TPM-backed code checked against a separate
+    device could add that without letting the TPM unlock the disk; see
+    "Measured boot" below.
   - A CMOS reset (jumper/battery) may clear the administrator password.
     Whether it also resets the Secure Boot keys depends on the firmware.
 - **Old UKIs stay valid.** Every UKI ever signed boots as long as the key is
@@ -434,6 +434,37 @@ boot the machine into an unlocked disk.
   change by another tool is not guarded against.
 - **The config file** is run as root: it is an administrator interface,
   accepted only when it belongs to root and nobody else can write it.
+
+## Measured boot (possible next layer)
+
+With a working TPM, this UKI's systemd-stub already measures its embedded
+sections (kernel, initrd, command line, etc.) into PCR 11. UEFI measures
+executed EFI images, including the boot loader and UKI, into PCR 4; PCR 7
+records the Secure Boot policy. These measurements record what booted, but
+by themselves they do not tell the user whether it was the *expected* boot.
+See [systemd's measurement list](https://systemd.io/TPM2_PCR_MEASUREMENTS/)
+and the [Linux PCR registry](https://uapi-group.org/specifications/specs/linux_tpm_pcr_registry/).
+
+One independent check is [tpm2-totp](https://github.com/tpm2-software/tpm2-totp):
+seal a TOTP secret to selected SHA-256 PCRs, show the code from the initrd
+**before** the FIDO2 unlock prompt, and compare it with an authenticator on
+another device. PCR 4 and 7 would cover the loaded EFI binaries and Secure
+Boot policy. Merely checking PCR 7 would miss a changed UKI that still has
+a trusted signature. PCR 11 identifies the UKI's sections more directly,
+but systemd also extends it at boot phases, so the value in the initrd may
+differ from the one seen after boot.
+
+This needs a tested update and recovery procedure before enabling it here.
+Changed UKI contents, a boot-loader update, or a different snapshot can
+change PCR 4 (and changed UKI sections change PCR 11). `tpm2-totp` binds
+to the *current* PCR values and cannot enroll future values, so the code
+may fail to match after a legitimate update. Do not use its reseal password
+to accept an unexplained mismatch. Replaying an old UKI that matches
+the *currently* sealed PCRs can still produce the expected code; measurements
+alone do not enforce freshness. Signed PCR policies from
+`ukify` can authorize changing PCR 11 values for TPM secrets, but
+`tpm2-totp` does not consume those policies. The FIDO2 LUKS unlock should
+remain the only normal disk-unlock path.
 
 ## License
 
